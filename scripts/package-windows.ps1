@@ -1,12 +1,31 @@
 [CmdletBinding()]
 param(
     [switch]$PrepareOnly,
+    [switch]$BuildInstaller,
+    [string]$IsccPath,
     [string]$PlatformToolsUrl = 'https://dl.google.com/android/repository/platform-tools-latest-windows.zip',
     [string]$Sha256
 )
 
 $ErrorActionPreference = 'Stop'
+if ($PrepareOnly -and $BuildInstaller) { throw 'PrepareOnly cannot be combined with BuildInstaller.' }
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+if ($BuildInstaller) {
+    if (-not $IsccPath) {
+        $compiler = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+        if ($compiler) { $IsccPath = $compiler.Source }
+    }
+    if (-not $IsccPath) {
+        foreach ($base in @(${env:ProgramFiles(x86)}, $env:ProgramFiles, "$env:LOCALAPPDATA\Programs")) {
+            if (-not $base) { continue }
+            $candidate = Join-Path $base 'Inno Setup 6\ISCC.exe'
+            if (Test-Path -LiteralPath $candidate) { $IsccPath = $candidate; break }
+        }
+    }
+    if (-not $IsccPath -or -not (Test-Path -LiteralPath $IsccPath -PathType Leaf)) {
+        throw 'Install Inno Setup 6.3+ or pass -IsccPath to build the Setup installer.'
+    }
+}
 $vendor = Join-Path $root 'vendor\windows'
 $tools = Join-Path $vendor 'platform-tools'
 $required = @('adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll', 'NOTICE.txt', 'source.properties')
@@ -77,9 +96,24 @@ try {
     if (Test-Path -LiteralPath (Join-Path $vendor 'platform-tools.sha256')) {
         Copy-Item -LiteralPath (Join-Path $vendor 'platform-tools.sha256') -Destination $package
     }
-    $zip = "$package.zip"
-    Compress-Archive -LiteralPath $package -DestinationPath $zip
+    $version = ($metadata.packages | Where-Object { $_.name -eq 'androidtool' }).version
+    if (-not $version) { throw 'Unable to read AndroidTool version.' }
+    $zip = Join-Path $dist "AndroidTool-v$version-windows-x64.zip"
+    Compress-Archive -LiteralPath $package -DestinationPath $zip -Force
     Write-Host "Portable package: $zip"
+    $artifacts = @($zip)
+    if ($BuildInstaller) {
+        & $IsccPath "/DAppVersion=$version" "/DPackageDir=$package" "/DOutputDir=$dist" (Join-Path $PSScriptRoot 'windows-installer.iss')
+        if ($LASTEXITCODE -ne 0) { throw 'Setup installer build failed.' }
+        $setup = Join-Path $dist "AndroidTool-v$version-windows-x64-setup.exe"
+        if (-not (Test-Path -LiteralPath $setup)) { throw 'Setup installer is missing.' }
+        $artifacts += $setup
+        Write-Host "Setup installer: $setup"
+    }
+    foreach ($artifact in $artifacts) {
+        $hash = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$hash  $(Split-Path $artifact -Leaf)" | Set-Content -LiteralPath "$artifact.sha256" -Encoding ascii
+    }
 } finally {
     Pop-Location
 }

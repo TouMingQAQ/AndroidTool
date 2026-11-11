@@ -28,13 +28,15 @@ AndroidTool 是一个使用 Rust + egui 编写的便携式 Android 工具台。
 
 ## 快速开始
 
-1. 获取完整的 Windows 便携包并解压到可写目录，不要只复制 EXE。
+1. 获取 Windows ZIP 便携包并解压到可写目录，或运行 Setup 安装包；不要只复制主程序 EXE。
 2. 运行 `androidtool.exe`，在 Android 设备上启用开发者选项和 USB 调试，并确认授权。
 3. 从顶部设备选择器选择在线设备，再进入投屏、Logcat、安装器或文件工作区。
 4. 如需无线连接，Android 11+ 可在“无线调试”中通过二维码或配对码配对。
 5. 安装 AAB 前，在设置页下载或指定 bundletool 和 Java 17+；仅安装 APK 不需要这两项。
 
-Windows 便携包包含 ADB 与 scrcpy，但不预装 Java 和 bundletool。未发布二进制包时，可按下文自行构建。
+Windows ZIP 便携包和 Setup 安装包均包含 ADB 与 scrcpy，但不预装 Java 和 bundletool。Setup 默认安装到当前用户的 `%LOCALAPPDATA%\Programs\AndroidTool`，无需管理员权限，提供开始菜单入口、可选桌面快捷方式和卸载入口。卸载不主动删除个人配置、下载工具和缓存。未发布二进制包时，可按下文自行构建。
+
+推送版本标签（例如 `v0.0.1`，需与 Cargo 版本一致）后，GitHub Actions 会在 Windows 上测试并构建，随后发布 ZIP、Setup EXE 及各自的 SHA-256 文件到 GitHub Releases；也可以手动运行工作流获取构建产物。
 
 ## 开发与构建
 
@@ -62,9 +64,13 @@ Windows：
 ```powershell
 # 下载官方 ADB 和 scrcpy，并构建便携 ZIP
 powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1
+
+# 同时生成 ZIP 和 Setup 安装包（额外需要 Inno Setup 6.3+）
+powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 -BuildInstaller
+# 自定义编译器位置时增加：-IsccPath 'C:\path\to\ISCC.exe'
 ```
 
-产物位于 `dist/`，解压后运行其中的 `androidtool.exe`。请分发整个文件夹或 ZIP，不能只复制
+产物位于 `dist/`，命名为 `AndroidTool-v<版本>-windows-x64.zip` 和 `AndroidTool-v<版本>-windows-x64-setup.exe`，附带 `.sha256` 校验文件。ZIP 解压后运行其中的 `androidtool.exe`。请分发整个文件夹或 ZIP，不能只复制
 EXE；包内保留 ADB 和 scrcpy 的依赖 DLL、许可文件与版本信息。构建需要 Rust MSVC 工具链及 Visual C++
 Build Tools（请在开发者 PowerShell 中运行）。脚本不会打包个人设置、缓存或转换产物。
 

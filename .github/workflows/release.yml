@@ -1,0 +1,55 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = ($metadata.packages | Where-Object { $_.name -eq 'androidtool' }).version
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag does not match Cargo version $version" }
+      - name: Run tests
+        run: cargo test --locked
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --version=6.7.3 --no-progress -y
+          if ($LASTEXITCODE -notin 0, 1641, 3010) { throw 'Inno Setup installation failed' }
+      - name: Build ZIP and Setup packages
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -BuildInstaller
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AndroidTool-windows-x64
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+            dist/*.sha256
+          if-no-files-found: error
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $assets = @(Get-ChildItem dist -File | Where-Object { $_.Extension -in '.zip', '.exe', '.sha256' } | ForEach-Object { $_.FullName })
+          if ($assets.Count -ne 4) { throw 'Expected ZIP, Setup and their SHA-256 files' }
+          gh release create $env:GITHUB_REF_NAME @assets --title "AndroidTool $env:GITHUB_REF_NAME" --generate-notes
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
