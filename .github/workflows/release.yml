@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing version tag to rebuild and publish (leave empty for artifacts only)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -12,29 +17,45 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Check tag matches package version
-        if: startsWith(github.ref, 'refs/tags/')
+        if: env.RELEASE_TAG != ''
         shell: pwsh
         run: |
           $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $version = ($metadata.packages | Where-Object { $_.name -eq 'androidtool' }).version
-          if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag does not match Cargo version $version" }
+          if ($env:RELEASE_TAG -ne "v$version") { throw "Tag does not match Cargo version $version" }
+          $tagCommit = git rev-parse "refs/tags/$env:RELEASE_TAG^{commit}"
+          if ($LASTEXITCODE -ne 0) { throw 'Release tag does not exist' }
+          if ($tagCommit -ne (git rev-parse HEAD)) { throw 'Checkout does not match release tag' }
       - name: Run tests
         run: cargo test --locked
       - name: Install Inno Setup
         shell: pwsh
         run: |
-          choco install innosetup --version=6.7.3 --no-progress -y
-          if ($LASTEXITCODE -notin 0, 1641, 3010) { throw 'Inno Setup installation failed' }
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $installer
+          $expectedHash = '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732'
+          $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) { throw 'Inno Setup installer SHA-256 mismatch' }
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6'
+          $process = Start-Process -FilePath $installer -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /DIR=`"$installDir`"" -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Inno Setup installation failed: $($process.ExitCode)" }
+          $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) { throw 'Inno Setup compiler was not installed' }
+          "ISCC_PATH=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Build ZIP and Setup packages
         shell: pwsh
-        run: ./scripts/package-windows.ps1 -BuildInstaller
+        run: ./scripts/package-windows.ps1 -BuildInstaller -IsccPath "$env:ISCC_PATH"
       - uses: actions/upload-artifact@v4
         with:
           name: AndroidTool-windows-x64
@@ -44,12 +65,12 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
       - name: Publish GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: env.RELEASE_TAG != ''
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
           $assets = @(Get-ChildItem dist -File | Where-Object { $_.Extension -in '.zip', '.exe', '.sha256' } | ForEach-Object { $_.FullName })
           if ($assets.Count -ne 4) { throw 'Expected ZIP, Setup and their SHA-256 files' }
-          gh release create $env:GITHUB_REF_NAME @assets --title "AndroidTool $env:GITHUB_REF_NAME" --generate-notes
+          gh release create $env:RELEASE_TAG @assets --verify-tag --title "AndroidTool $env:RELEASE_TAG" --generate-notes
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
