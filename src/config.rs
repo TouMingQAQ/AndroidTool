@@ -24,6 +24,7 @@ pub struct AppConfig {
     pub max_log_lines: usize,
     pub log_auto_scroll: bool,
     pub auto_install_drops: bool,
+    pub signing_profiles: Vec<SigningProfile>,
     pub gamepad: GamepadConfig,
 }
 
@@ -47,6 +48,7 @@ impl Default for AppConfig {
             max_log_lines: 20_000,
             log_auto_scroll: true,
             auto_install_drops: true,
+            signing_profiles: Vec::new(),
             gamepad: GamepadConfig::default(),
         }
     }
@@ -96,6 +98,65 @@ impl AppConfig {
     }
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SigningProfile {
+    pub id: String,
+    pub name: String,
+    pub keystore_path: String,
+    pub key_alias: String,
+    // Passwords are deliberately session-only, never written to portable settings.
+    #[serde(skip)]
+    pub store_password: String,
+    #[serde(skip)]
+    pub key_password: String,
+}
+
+impl std::fmt::Debug for SigningProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SigningProfile")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("keystore_path", &self.keystore_path)
+            .field("key_alias", &self.key_alias)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SigningProfile {
+    pub fn resolved_keystore(&self) -> PathBuf {
+        util::install_dir().join(self.keystore_path.trim())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.keystore_path.trim().is_empty() || !self.resolved_keystore().is_file() {
+            return Err("请选择有效的 keystore 文件".into());
+        }
+        if self.key_alias.trim().is_empty() {
+            return Err("请输入密钥别名（Key alias）".into());
+        }
+        if self.store_password.is_empty() {
+            return Err("请输入 keystore 密码；密码仅在本次运行中保留".into());
+        }
+        if self.store_password.contains(['\r', '\n']) || self.key_password.contains(['\r', '\n']) {
+            return Err("bundletool 密码不支持换行符".into());
+        }
+        Ok(())
+    }
+
+    pub fn redact(&self, text: &str) -> String {
+        let mut secrets = [&self.store_password, &self.key_password];
+        secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        let mut text = text.to_owned();
+        for secret in secrets {
+            if !secret.is_empty() {
+                text = text.replace(secret, "[REDACTED]");
+            }
+        }
+        text
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GamepadConfig {
@@ -110,6 +171,51 @@ impl Default for GamepadConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signing_profiles_persist_metadata_but_never_passwords() {
+        let mut config = AppConfig::default();
+        config.signing_profiles.push(SigningProfile {
+            id: "release".into(),
+            name: "Production".into(),
+            keystore_path: "keys/release.jks".into(),
+            key_alias: "release-key".into(),
+            store_password: "store-secret".into(),
+            key_password: "key-secret".into(),
+        });
+        config.signing_profiles.push(SigningProfile {
+            id: "test".into(),
+            ..Default::default()
+        });
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("secret"));
+        assert!(!format!("{config:?}").contains("secret"));
+        let restored: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.signing_profiles.len(), 2);
+        let profile = &restored.signing_profiles[0];
+        assert_eq!(profile.key_alias, "release-key");
+        assert_eq!(
+            profile.resolved_keystore(),
+            util::install_dir().join("keys/release.jks")
+        );
+        assert!(profile.store_password.is_empty());
+        assert!(profile.key_password.is_empty());
+        let legacy: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(legacy.signing_profiles.is_empty());
+    }
+
+    #[test]
+    fn signing_output_redacts_both_passwords() {
+        let profile = SigningProfile {
+            store_password: "secret".into(),
+            key_password: "secret-long".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            profile.redact("secret-long / secret"),
+            "[REDACTED] / [REDACTED]"
+        );
+    }
 
     #[test]
     fn theme_preferences_round_trip_and_old_configs_follow_system() {

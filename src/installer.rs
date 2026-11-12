@@ -6,9 +6,11 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use chrono::Local;
+use ring::rand::{SecureRandom, SystemRandom};
 use zip::ZipArchive;
 
 use crate::adb::Adb;
+use crate::config::SigningProfile;
 use crate::util;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +56,7 @@ pub struct InstallRequest {
     pub package: PathBuf,
     pub convert_only: bool,
     pub output_apk: Option<PathBuf>,
+    pub signing: Option<SigningProfile>,
 }
 
 #[derive(Debug)]
@@ -188,6 +191,18 @@ fn convert_aab(
     request: &InstallRequest,
     sender: &mpsc::Sender<InstallEvent>,
 ) -> Result<PathBuf, String> {
+    let signing = request
+        .signing
+        .as_ref()
+        .ok_or("AAB 转换需要先选择签名密钥")?;
+    signing.validate()?;
+    log(
+        sender,
+        format!(
+            "使用签名密钥：{}（别名：{}）",
+            signing.name, signing.key_alias
+        ),
+    );
     if !request.java_path.is_file() {
         return Err("AAB 转换需要 Java 17+，请先配置 java".to_owned());
     }
@@ -208,7 +223,8 @@ fn convert_aab(
 
     progress(sender, 0.16, "bundletool 构建 Universal APK");
     log(sender, "正在调用 bundletool build-apks …".to_owned());
-    let output = util::command(&request.java_path)
+    let mut command = util::command(&request.java_path);
+    command
         .arg("-jar")
         .arg(&request.bundletool_path)
         .arg("build-apks")
@@ -216,12 +232,18 @@ fn convert_aab(
         .arg(format!("--output={}", temp_apks.display()))
         .arg("--mode=universal")
         .arg("--overwrite")
+        .arg(format!("--ks={}", signing.resolved_keystore().display()))
+        .arg(format!("--ks-key-alias={}", signing.key_alias.trim()));
+    let passwords = SigningPasswordFiles::new(signing)?;
+    passwords.configure(&mut command);
+    let output = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .map_err(|error| format!("无法启动 bundletool: {error}"))?;
+    drop(passwords);
 
-    let output_text = util::output_text(&output);
+    let output_text = signing.redact(&util::output_text(&output));
     if !output.status.success() {
         let _ = fs::remove_file(&temp_apks);
         return Err(format!("bundletool 转换失败：\n{output_text}"));
@@ -245,6 +267,78 @@ fn convert_aab(
     log(sender, format!("Universal APK：{}", output_path.display()));
     progress(sender, 0.64, "转换完成");
     Ok(output_path)
+}
+
+struct PasswordFile {
+    path: PathBuf,
+    _file: File,
+}
+
+impl PasswordFile {
+    fn new(password: &str) -> Result<Self, String> {
+        if password.contains(['\r', '\n']) {
+            return Err("bundletool 密码文件不支持换行符".into());
+        }
+        let mut random = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| "无法生成密码文件名")?;
+        let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let path = std::env::temp_dir().join(format!("androidtool-signing-{suffix}.tmp"));
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Delete on handle close also covers an application crash.
+            options.custom_flags(0x04000000).share_mode(0x1 | 0x4);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|error| format!("无法创建临时密码文件: {error}"))?;
+        let mut secret = Self { path, _file: file };
+        secret
+            ._file
+            .write_all(password.as_bytes())
+            .map_err(|_| "无法写入临时密码文件")?;
+        secret._file.flush().map_err(|_| "无法刷新临时密码文件")?;
+        Ok(secret)
+    }
+}
+
+impl Drop for PasswordFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct SigningPasswordFiles {
+    store: PasswordFile,
+    key: PasswordFile,
+}
+
+impl SigningPasswordFiles {
+    fn new(signing: &SigningProfile) -> Result<Self, String> {
+        Ok(Self {
+            store: PasswordFile::new(&signing.store_password)?,
+            key: PasswordFile::new(if signing.key_password.is_empty() {
+                &signing.store_password
+            } else {
+                &signing.key_password
+            })?,
+        })
+    }
+
+    fn configure(&self, command: &mut std::process::Command) {
+        command
+            .arg(format!("--ks-pass=file:{}", self.store.path.display()))
+            .arg(format!("--key-pass=file:{}", self.key.path.display()));
+    }
 }
 
 fn extract_universal_apk(apks_path: &Path, output_apk: &Path) -> Result<(), String> {
@@ -329,6 +423,78 @@ fn log(sender: &mpsc::Sender<InstallEvent>, line: impl Into<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signing_password_files_are_private_ephemeral_and_not_in_arguments() {
+        let signing = SigningProfile {
+            store_password: "store-secret-密碼".into(),
+            ..Default::default()
+        };
+        let paths;
+        {
+            let passwords = SigningPasswordFiles::new(&signing).unwrap();
+            paths = [passwords.store.path.clone(), passwords.key.path.clone()];
+            assert_eq!(
+                fs::read_to_string(&paths[0]).unwrap(),
+                signing.store_password
+            );
+            assert_eq!(
+                fs::read_to_string(&paths[1]).unwrap(),
+                signing.store_password
+            );
+            let mut command = util::command("java");
+            passwords.configure(&mut command);
+            let args: Vec<_> = command.get_args().map(|v| v.to_string_lossy()).collect();
+            assert_eq!(args.len(), 2);
+            assert!(args[0].starts_with("--ks-pass=file:"));
+            assert!(args[1].starts_with("--key-pass=file:"));
+            assert!(!format!("{command:?}").contains(&signing.store_password));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&paths[0]).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+        assert!(paths.iter().all(|p| !p.exists()));
+    }
+
+    #[test]
+    fn signing_password_files_support_separate_passwords_and_reject_newlines() {
+        let signing = SigningProfile {
+            store_password: "store".into(),
+            key_password: "private".into(),
+            ..Default::default()
+        };
+        let passwords = SigningPasswordFiles::new(&signing).unwrap();
+        assert_eq!(fs::read_to_string(&passwords.key.path).unwrap(), "private");
+        assert!(PasswordFile::new("line\nbreak").is_err());
+    }
+
+    #[test]
+    #[ignore = "requires Java 17+ source launcher"]
+    fn java_can_read_bundletool_password_files() {
+        let signing = SigningProfile {
+            store_password: "java-read-test-密碼".into(),
+            ..Default::default()
+        };
+        let passwords = SigningPasswordFiles::new(&signing).unwrap();
+        let source = passwords.store.path.with_extension("java");
+        fs::write(&source, "import java.nio.file.*; class ReadPassword { public static void main(String[] args) throws Exception { System.out.write(Files.readAllBytes(Path.of(args[0]))); } }").unwrap();
+        let output = util::command("java")
+            .arg(&source)
+            .arg(&passwords.store.path)
+            .output()
+            .unwrap();
+        let _ = fs::remove_file(source);
+        assert!(output.status.success(), "{}", util::output_text(&output));
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            signing.store_password
+        );
+    }
 
     #[test]
     fn detects_supported_package_kinds() {

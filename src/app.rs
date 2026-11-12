@@ -11,7 +11,7 @@ use eframe::egui::{
 };
 
 use crate::adb::{Adb, DeviceInfo};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, SigningProfile};
 use crate::device::{DeviceSnapshot, DeviceWatcher};
 use crate::gamepad::{GamepadHub, GamepadKind, GamepadVisualState};
 use crate::installer::{
@@ -305,10 +305,14 @@ struct InstallQueueItem {
     path: PathBuf,
     kind: PackageKind,
     convert_only: bool,
+    signing: Option<SigningProfile>,
 }
 
 #[derive(Default)]
 struct InstallerState {
+    selected_signing: Option<String>,
+    signing_error: Option<String>,
+    signing_deferred: bool,
     queue: VecDeque<InstallQueueItem>,
     session: Option<InstallSession>,
     active_name: Option<String>,
@@ -899,7 +903,9 @@ impl AndroidToolApp {
             path: path.clone(),
             kind,
             convert_only,
+            signing: None,
         });
+        self.installer.signing_deferred = false;
         self.toast(
             format!(
                 "已加入安装队列：{} ({})",
@@ -913,6 +919,14 @@ impl AndroidToolApp {
 
     fn start_next_install(&mut self) {
         if self.installer.session.is_some() {
+            return;
+        }
+        if self
+            .installer
+            .queue
+            .front()
+            .is_some_and(|item| item.kind == PackageKind::Aab && item.signing.is_none())
+        {
             return;
         }
         let Some(item) = self.installer.queue.pop_front() else {
@@ -951,6 +965,7 @@ impl AndroidToolApp {
             package: item.path.clone(),
             convert_only: item.convert_only,
             output_apk,
+            signing: item.signing,
         };
         self.installer.active_name = Some(util::file_name(&item.path));
         self.installer.active_convert_only = item.convert_only;
@@ -3371,6 +3386,15 @@ impl AndroidToolApp {
         });
 
         ui.add_space(14.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("AAB 转换 / 安装前将逐项确认签名密钥。");
+            if self.installer.signing_deferred && ui.button("选择签名并继续").clicked() {
+                self.installer.signing_deferred = false;
+            }
+            if ui.link("管理签名密钥").clicked() {
+                self.set_page(Page::Settings);
+            }
+        });
         let drop_response = Frame::new()
             .fill(Color32::from_rgba_unmultiplied(43, 218, 195, 8))
             .stroke(Stroke::new(1.0, theme::alpha(colors.accent, 0.35)))
@@ -4121,6 +4145,8 @@ impl AndroidToolApp {
     fn page_settings(&mut self, ui: &mut Ui) {
         let colors = theme::palette(ui.ctx());
         ui.set_max_width(ui.available_width().min(1100.0));
+        self.settings_signing(ui);
+        ui.add_space(12.0);
         self.card_frame(ui).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             self.section_title(ui, "工具链", "便携式路径会优先于系统 PATH");
@@ -4350,6 +4376,145 @@ impl AndroidToolApp {
         }
         if !task.status.is_empty() {
             ui.label(RichText::new(&task.status).size(10.0).color(colors.muted));
+        }
+    }
+
+    fn settings_signing(&mut self, ui: &mut Ui) {
+        let colors = theme::palette(ui.ctx());
+        let mut changed = false;
+        let mut remove = None;
+        self.card_frame(ui).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("AAB 签名密钥").size(15.0).strong());
+                ui.label(RichText::new("密码仅在本次运行中保留").size(10.5).color(colors.muted));
+            });
+            if self.installer.signing_deferred && ui.button("返回待签名任务").clicked() {
+                self.installer.signing_deferred = false;
+            }
+            ui.add(egui::Label::new(RichText::new("转换后 APK 的签名必须与设备上已安装应用的签名一致，才能覆盖安装。Play 应用签名密钥可能不同于上传密钥。")
+                .size(10.5).color(colors.muted)).wrap());
+            if self.config.signing_profiles.is_empty() {
+                ui.label(RichText::new("尚未配置密钥").color(colors.muted));
+            }
+            for (index, profile) in self.config.signing_profiles.iter_mut().enumerate() {
+                ui.push_id(&profile.id.clone(), |ui| {
+                    ui.separator();
+                    ui.label("名称");
+                    changed |= ui.add_sized([(ui.available_width() - 12.0).max(40.0), 28.0], TextEdit::singleline(&mut profile.name).hint_text("例如：生产环境")).changed();
+                    ui.label("密钥别名（Key alias）");
+                    changed |= ui.add_sized([(ui.available_width() - 12.0).max(40.0), 28.0], TextEdit::singleline(&mut profile.key_alias)).changed();
+                    ui.horizontal(|ui| {
+                        ui.label("密钥文件");
+                        let width = (ui.available_width() - 110.0).max(40.0);
+                        changed |= ui.add_sized([width, 28.0], TextEdit::singleline(&mut profile.keystore_path).hint_text(".jks / .keystore / .p12")).changed();
+                        if ui.button("选择文件").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().add_filter("Keystore", &["jks", "keystore", "p12", "pfx"]).pick_file() {
+                                profile.keystore_path = util::portable_path(&path);
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.label("Keystore 密码");
+                    ui.add_sized([(ui.available_width() - 12.0).max(40.0), 28.0], TextEdit::singleline(&mut profile.store_password).password(true));
+                    ui.label("密钥密码（留空则与 Keystore 密码相同）");
+                    ui.add_sized([(ui.available_width() - 12.0).max(40.0), 28.0], TextEdit::singleline(&mut profile.key_password).password(true));
+                    if ui.button("删除此密钥配置").clicked() { remove = Some(index); }
+                });
+            }
+            ui.add_space(5.0);
+            if ui.button("添加密钥").clicked() {
+                let id = format!("{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default());
+                self.config.signing_profiles.push(SigningProfile { id, ..Default::default() });
+                changed = true;
+            }
+        });
+        if let Some(index) = remove {
+            self.config.signing_profiles.remove(index);
+            changed = true;
+        }
+        if changed {
+            self.mark_config_dirty();
+        }
+    }
+
+    fn show_signing_modal(&mut self, ctx: &egui::Context) {
+        if self.installer.signing_deferred
+            || self.installer.session.is_some()
+            || !self
+                .installer
+                .queue
+                .front()
+                .is_some_and(|item| item.kind == PackageKind::Aab && item.signing.is_none())
+        {
+            self.installer.signing_error = None;
+            return;
+        }
+        let mut confirm = false;
+        let mut cancel = false;
+        let mut manage = false;
+        egui::Modal::new(Id::new("aab-signing-modal")).show(ctx, |ui| {
+            ui.set_max_width(480.0);
+            ui.heading("选择 AAB 签名密钥");
+            if let Some(item) = self.installer.queue.front() {
+                ui.add(egui::Label::new(format!("文件：{}", util::file_name(&item.path))).wrap());
+            }
+            let selected_name = self.config.signing_profiles.iter()
+                .find(|p| Some(&p.id) == self.installer.selected_signing.as_ref())
+                .map(|p| if p.name.trim().is_empty() { "未命名密钥" } else { p.name.as_str() })
+                .unwrap_or("请选择密钥");
+            egui::ComboBox::from_id_salt("aab-signing-profile")
+                .selected_text(util::truncate_chars(selected_name, 32))
+                .width(ui.available_width().min(380.0))
+                .show_ui(ui, |ui| {
+                    for profile in &self.config.signing_profiles {
+                        let label = if profile.name.trim().is_empty() { "未命名密钥" } else { &profile.name };
+                        ui.selectable_value(&mut self.installer.selected_signing, Some(profile.id.clone()), util::truncate_chars(label, 40));
+                    }
+                });
+            if let Some(profile) = self.config.signing_profiles.iter_mut().find(|p| Some(&p.id) == self.installer.selected_signing.as_ref()) {
+                ui.add(egui::Label::new(format!("别名：{}", profile.key_alias)).wrap());
+                ui.label("Keystore 密码");
+                ui.add(TextEdit::singleline(&mut profile.store_password).password(true).desired_width(f32::INFINITY));
+                ui.label("密钥密码（留空则与 Keystore 密码相同）");
+                ui.add(TextEdit::singleline(&mut profile.key_password).password(true).desired_width(f32::INFINITY));
+            }
+            ui.add(egui::Label::new("仅可覆盖相同签名的已安装应用；应用商店分发密钥可能不同于上传密钥。密码不会保存到配置文件。").wrap());
+            if let Some(error) = &self.installer.signing_error {
+                ui.colored_label(theme::palette(ctx).red, error);
+            }
+            ui.horizontal_wrapped(|ui| {
+                confirm = ui.button("确认并继续").clicked();
+                manage = ui.button("管理密钥").clicked();
+                cancel = ui.button("取消此任务").clicked();
+            });
+        });
+        if confirm {
+            let result = self
+                .config
+                .signing_profiles
+                .iter()
+                .find(|p| Some(&p.id) == self.installer.selected_signing.as_ref())
+                .ok_or_else(|| "请先选择签名密钥".to_owned())
+                .and_then(|p| p.validate().map(|_| p.clone()));
+            match result {
+                Ok(profile) => {
+                    if let Some(item) = self.installer.queue.front_mut() {
+                        item.signing = Some(profile);
+                    }
+                    self.installer.signing_error = None;
+                }
+                Err(error) => self.installer.signing_error = Some(error),
+            }
+        }
+        if cancel {
+            self.installer.queue.pop_front();
+            self.installer.signing_error = None;
+        }
+        if manage {
+            // Keep the task queued while the user edits profiles.
+            self.set_page(Page::Settings);
+            self.installer.signing_deferred = true;
+            self.installer.signing_error = None;
         }
     }
 
@@ -5107,6 +5272,7 @@ impl eframe::App for AndroidToolApp {
         self.show_gamepad_overlay(ctx);
         self.send_gamepad_state();
         self.show_wireless_modal(ctx);
+        self.show_signing_modal(ctx);
         self.show_drop_overlay(ctx);
         self.show_toasts(ctx);
         #[cfg(windows)]
@@ -5900,6 +6066,52 @@ drwxrwx--- 2 root sdcard_rw 4096 2026-11-11 10:20 Download
                     .all(|x| (x - browse_positions[0]).abs() < 1.0),
                 "browse buttons are not aligned at width {width}: {browse_positions:?}"
             );
+        }
+    }
+
+    #[test]
+    fn unsigned_aab_waits_for_explicit_profile_confirmation() {
+        let mut app = AndroidToolApp::from_config(AppConfig::default(), false);
+        app.enqueue_package(PathBuf::from("application.aab"), true);
+        app.start_next_install();
+        assert!(app.installer.session.is_none());
+        assert_eq!(app.installer.queue.len(), 1);
+        assert!(app.installer.queue.front().unwrap().signing.is_none());
+    }
+
+    #[test]
+    fn signing_settings_layout_fits_multiple_profiles_and_long_paths() {
+        for width in [520.0, 720.0, 1000.0] {
+            let ctx = egui::Context::default();
+            theme::setup(&ctx);
+            let mut app = AndroidToolApp::from_config(AppConfig::default(), false);
+            for id in ["release", "testing"] {
+                app.config.signing_profiles.push(SigningProfile {
+                    id: id.into(),
+                    name: "very long signing profile ".repeat(10),
+                    keystore_path: "long-directory/".repeat(30),
+                    key_alias: "long-alias".repeat(20),
+                    ..Default::default()
+                });
+            }
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 900.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let limit = ui.max_rect();
+                    app.settings_signing(ui);
+                    assert!(
+                        ui.min_rect().right() <= limit.right() + 1.0,
+                        "width {width}: {:?} vs {limit:?}",
+                        ui.min_rect()
+                    );
+                });
+            });
         }
     }
 

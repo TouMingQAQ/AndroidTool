@@ -9,3 +9,7 @@
 /tools
 .env
 .env.*
+*.jks
+*.keystore
+*.p12
+*.pfx

@@ -1,6 +1,6 @@
 [package]
 name = "androidtool"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "AndroidTool - a portable Android device toolkit powered by Rust, egui and ADB"
 license = "MIT"
