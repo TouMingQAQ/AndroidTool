@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,7 +15,8 @@ use crate::config::{AppConfig, SigningProfile};
 use crate::device::{DeviceSnapshot, DeviceWatcher};
 use crate::gamepad::{GamepadHub, GamepadKind, GamepadVisualState};
 use crate::installer::{
-    InstallEvent, InstallRequest, InstallSession, PackageKind, converted_output_path,
+    InstallEvent, InstallLogLevel, InstallRequest, InstallSession, PackageKind,
+    converted_output_path,
 };
 use crate::logcat::{
     LogEntry, LogLevel, LogcatEvent, LogcatSession, export_file, import_file,
@@ -317,11 +318,17 @@ struct InstallerState {
     session: Option<InstallSession>,
     active_name: Option<String>,
     active_convert_only: bool,
+    active_kind: Option<PackageKind>,
     progress: f32,
     stage: String,
-    logs: Vec<String>,
+    logs: Vec<(InstallLogLevel, String, String)>,
     last_success: bool,
     converted: Option<PathBuf>,
+    apk_library: Vec<PathBuf>,
+    selected_apks: BTreeSet<PathBuf>,
+    apk_library_rect: Option<Rect>,
+    apk_library_loaded: bool,
+    log_auto_scroll: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -450,6 +457,9 @@ pub struct AndroidToolApp {
     wireless: WirelessState,
     toasts: Vec<Toast>,
     last_adb_error: Option<(String, Instant)>,
+    mcp: Option<crate::mcp::McpService>,
+    mcp_error: String,
+    mcp_signing_id: String,
 }
 
 impl AndroidToolApp {
@@ -526,10 +536,16 @@ impl AndroidToolApp {
             wireless: WirelessState::default(),
             toasts: Vec::new(),
             last_adb_error: None,
+            mcp: None,
+            mcp_error: String::new(),
+            mcp_signing_id: String::new(),
         };
         if connect_devices {
             app.ensure_watcher();
             app.refresh_devices_now();
+            if app.config.mcp_enabled {
+                app.start_mcp();
+            }
         }
         app
     }
@@ -917,6 +933,30 @@ impl AndroidToolApp {
         self.set_page(Page::Installer);
     }
 
+    fn refresh_apk_library(&mut self) {
+        match crate::apk_library::scan() {
+            Ok(paths) => {
+                self.installer.apk_library = paths;
+                let library = &self.installer.apk_library;
+                self.installer
+                    .selected_apks
+                    .retain(|path| library.contains(path));
+            }
+            Err(error) => self.toast(error, false),
+        }
+    }
+
+    fn import_apk_to_library(&mut self, path: &Path) {
+        match crate::apk_library::import(path) {
+            Ok(imported) => {
+                self.refresh_apk_library();
+                self.installer.selected_apks.insert(imported.clone());
+                self.toast(format!("已保存 APK：{}", util::file_name(&imported)), true);
+            }
+            Err(error) => self.toast(error, false),
+        }
+    }
+
     fn start_next_install(&mut self) {
         if self.installer.session.is_some() {
             return;
@@ -956,7 +996,7 @@ impl AndroidToolApp {
             .config
             .resolved_bundletool()
             .unwrap_or_else(|| util::install_dir().join("tools").join("bundletool.jar"));
-        let output_apk = item.convert_only.then(|| converted_output_path(&item.path));
+        let output_apk = (item.kind == PackageKind::Aab).then(|| converted_output_path(&item.path));
         let request = InstallRequest {
             adb_path: adb_path.unwrap_or_default(),
             java_path,
@@ -966,10 +1006,14 @@ impl AndroidToolApp {
             convert_only: item.convert_only,
             output_apk,
             signing: item.signing,
+            cancel: None,
         };
         self.installer.active_name = Some(util::file_name(&item.path));
         self.installer.active_convert_only = item.convert_only;
+        self.installer.active_kind = Some(item.kind);
+        self.installer.log_auto_scroll = true;
         self.installer.progress = 0.0;
+        self.installer.last_success = false;
         self.installer.stage = "准备中".to_owned();
         self.installer.logs.clear();
         self.installer.converted = None;
@@ -990,11 +1034,19 @@ impl AndroidToolApp {
                     self.installer.progress = progress;
                     self.installer.stage = stage;
                 }
-                InstallEvent::Log(line) => {
-                    self.installer.logs.push(line);
-                    if self.installer.logs.len() > 200 {
+                InstallEvent::Log { level, line } => {
+                    self.installer.logs.push((
+                        level,
+                        chrono::Local::now().format("%H:%M:%S").to_string(),
+                        line,
+                    ));
+                    if self.installer.logs.len() > 1000 {
                         self.installer.logs.remove(0);
                     }
+                }
+                InstallEvent::Converted(path) => {
+                    self.installer.converted = Some(path);
+                    self.refresh_apk_library();
                 }
                 InstallEvent::Finished {
                     success,
@@ -1002,14 +1054,29 @@ impl AndroidToolApp {
                     converted,
                 } => {
                     self.installer.last_success = success;
-                    self.installer.progress = 1.0;
+                    if success {
+                        self.installer.progress = 1.0;
+                    }
                     self.installer.stage = if success {
                         "完成".to_owned()
                     } else {
                         "失败".to_owned()
                     };
-                    self.installer.logs.push(message.clone());
-                    self.installer.converted = converted;
+                    self.installer.logs.push((
+                        if success {
+                            InstallLogLevel::Success
+                        } else {
+                            InstallLogLevel::Error
+                        },
+                        chrono::Local::now().format("%H:%M:%S").to_string(),
+                        message.clone(),
+                    ));
+                    if converted.is_some() {
+                        self.installer.converted = converted;
+                    }
+                    if self.installer.active_kind == Some(PackageKind::Aab) {
+                        self.refresh_apk_library();
+                    }
                     self.toast(message, success);
                     finished = true;
                 }
@@ -1491,7 +1558,18 @@ impl AndroidToolApp {
 
         for path in dropped {
             let kind = PackageKind::detect(&path);
-            if kind != PackageKind::Unknown && self.config.auto_install_drops {
+            let over_library = self.page == Page::Installer
+                && self.installer.apk_library_rect.is_some_and(|rect| {
+                    ctx.input(|input| {
+                        input
+                            .pointer
+                            .latest_pos()
+                            .is_some_and(|pos| rect.contains(pos))
+                    })
+                });
+            if kind == PackageKind::Apk && over_library {
+                self.import_apk_to_library(&path);
+            } else if kind != PackageKind::Unknown && self.config.auto_install_drops {
                 self.enqueue_package(path, false);
             } else {
                 if !self.files.local_files.contains(&path) {
@@ -1524,6 +1602,9 @@ impl AndroidToolApp {
             }
         }
         self.handle_dropped_files(ctx);
+        if let Some(service) = &self.mcp {
+            service.update_tools(&self.config);
+        }
         self.ensure_watcher();
         self.poll_devices();
         self.ensure_streams();
@@ -3331,6 +3412,10 @@ impl AndroidToolApp {
 
     fn page_installer(&mut self, ui: &mut Ui) {
         let colors = theme::palette(ui.ctx());
+        if !self.installer.apk_library_loaded {
+            self.refresh_apk_library();
+            self.installer.apk_library_loaded = true;
+        }
         ui.horizontal_wrapped(|ui| {
             self.stat_card(
                 ui,
@@ -3461,6 +3546,9 @@ impl AndroidToolApp {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
+        ui.add_space(14.0);
+        self.apk_library_panel(ui);
+
         if !self.installer.queue.is_empty() {
             ui.add_space(12.0);
             self.section_title(ui, "等待队列", "按顺序执行");
@@ -3515,21 +3603,83 @@ impl AndroidToolApp {
                 });
                 ui.add(
                     ProgressBar::new(self.installer.progress)
-                        .text(&self.installer.stage)
+                        .text(format!(
+                            "{}  ·  {:>3.0}%",
+                            self.installer.stage,
+                            self.installer.progress * 100.0
+                        ))
                         .animate(true)
                         .fill(colors.accent_dark),
                 );
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("实时日志").size(11.0).strong());
+                    ui.label(
+                        RichText::new(format!("{} 条", self.installer.logs.len()))
+                            .size(10.0)
+                            .color(colors.muted),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.checkbox(&mut self.installer.log_auto_scroll, "自动滚动");
+                        if ui.small_button("清空").clicked() {
+                            self.installer.logs.clear();
+                        }
+                        if ui.small_button("复制").clicked() {
+                            let text = self
+                                .installer
+                                .logs
+                                .iter()
+                                .map(|(_, time, line)| format!("[{time}] {line}"))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            ui.ctx().copy_text(text);
+                        }
+                    });
+                });
+                let stages = if self.installer.active_kind == Some(PackageKind::Aab) {
+                    let mut steps = vec![("检查", 0.04), ("bundletool", 0.12), ("提取 APK", 0.72)];
+                    if !self.installer.active_convert_only {
+                        steps.push(("安装", 0.78));
+                    }
+                    steps.push(("完成", 1.0));
+                    steps
+                } else {
+                    vec![("检查", 0.04), ("安装", 0.78), ("完成", 1.0)]
+                };
+                ui.horizontal_wrapped(|ui| {
+                    for (index, (label, threshold)) in stages.iter().enumerate() {
+                        let completed = stages
+                            .get(index + 1)
+                            .is_some_and(|(_, next)| self.installer.progress >= *next)
+                            || (index + 1 == stages.len() && self.installer.last_success);
+                        let active = !completed && self.installer.progress >= *threshold;
+                        let color = if completed {
+                            colors.green
+                        } else if active {
+                            colors.accent
+                        } else {
+                            colors.muted
+                        };
+                        ui.label(RichText::new(format!("● {label}")).size(10.0).color(color));
+                    }
+                });
                 ScrollArea::vertical()
                     .id_salt("installer-log")
                     .max_height(160.0)
-                    .stick_to_bottom(true)
+                    .stick_to_bottom(self.installer.log_auto_scroll)
                     .show(ui, |ui| {
-                        for line in &self.installer.logs {
+                        for (level, time, line) in &self.installer.logs {
+                            let (marker, color) = match level {
+                                InstallLogLevel::Step => ("›", colors.accent),
+                                InstallLogLevel::Success => ("✓", colors.green),
+                                InstallLogLevel::Warning => ("!", colors.orange),
+                                InstallLogLevel::Error => ("×", colors.red),
+                                InstallLogLevel::Output => ("·", colors.muted),
+                            };
                             ui.label(
-                                RichText::new(line)
+                                RichText::new(format!("{time} {marker} {line}"))
                                     .monospace()
                                     .size(10.5)
-                                    .color(colors.muted),
+                                    .color(color),
                             );
                         }
                     });
@@ -3550,6 +3700,119 @@ impl AndroidToolApp {
                     });
                 }
             });
+        }
+    }
+
+    fn apk_library_panel(&mut self, ui: &mut Ui) {
+        let colors = theme::palette(ui.ctx());
+        let mut install = Vec::new();
+        let response = self.card_frame(ui).show(ui, |ui| {
+            self.section_title(ui, "APK 列表", "拖入 APK 保存到列表，勾选后可反复安装");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("添加 APK").clicked() {
+                    if let Some(paths) = rfd::FileDialog::new()
+                        .add_filter("Android APK", &["apk"])
+                        .pick_files()
+                    {
+                        for path in paths {
+                            self.import_apk_to_library(&path);
+                        }
+                    }
+                }
+                if ui.button("刷新列表").clicked() {
+                    self.refresh_apk_library();
+                }
+                if ui.button("打开 APK 目录").clicked() {
+                    if let Err(error) = util::ensure_dir(&util::apk_library_dir()) {
+                        self.toast(error, false);
+                    } else {
+                        util::open_folder(&util::apk_library_dir());
+                    }
+                }
+                if ui.button("全选").clicked() {
+                    self.installer.selected_apks =
+                        self.installer.apk_library.iter().cloned().collect();
+                }
+                if ui.button("取消选择").clicked() {
+                    self.installer.selected_apks.clear();
+                }
+            });
+            if self.installer.apk_library.is_empty() {
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new("将一个或多个 APK 拖到此区域，或点击“添加 APK”。")
+                        .color(colors.muted),
+                );
+                ui.label(
+                    RichText::new("AAB 转换后的 APK 自动保留并显示在这里，重启后仍可使用。")
+                        .size(11.0)
+                        .color(colors.muted),
+                );
+                ui.add_space(12.0);
+            } else {
+                ScrollArea::vertical()
+                    .id_salt("apk-library-list")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for path in &self.installer.apk_library {
+                            ui.horizontal(|ui| {
+                                let mut selected = self.installer.selected_apks.contains(path);
+                                if ui.checkbox(&mut selected, "").changed() {
+                                    if selected {
+                                        self.installer.selected_apks.insert(path.clone());
+                                    } else {
+                                        self.installer.selected_apks.remove(path);
+                                    }
+                                }
+                                let size = std::fs::metadata(path)
+                                    .map(|meta| meta.len() as f64 / 1024.0 / 1024.0)
+                                    .unwrap_or(0.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(util::file_name(path)).size(12.0),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(path.display().to_string());
+                                ui.label(
+                                    RichText::new(format!("{size:.1} MB"))
+                                        .size(10.5)
+                                        .color(colors.muted),
+                                );
+                                if ui.small_button("安装").clicked() {
+                                    install.push(path.clone());
+                                }
+                            });
+                        }
+                    });
+            }
+            ui.horizontal_wrapped(|ui| {
+                let count = self.installer.selected_apks.len();
+                if ui
+                    .add_enabled(
+                        count > 0,
+                        egui::Button::new(format!("安装选中 APK（{count}）")),
+                    )
+                    .clicked()
+                {
+                    install.extend(
+                        self.installer
+                            .apk_library
+                            .iter()
+                            .filter(|path| self.installer.selected_apks.contains(*path))
+                            .cloned(),
+                    );
+                }
+                ui.label(
+                    RichText::new("安装到顶部所选设备，多个 APK 按顺序执行")
+                        .size(10.5)
+                        .color(colors.muted),
+                );
+            });
+        });
+        self.installer.apk_library_rect = Some(response.response.rect);
+        for path in install {
+            self.enqueue_package(path, false);
         }
     }
 
@@ -4145,6 +4408,8 @@ impl AndroidToolApp {
     fn page_settings(&mut self, ui: &mut Ui) {
         let colors = theme::palette(ui.ctx());
         ui.set_max_width(ui.available_width().min(1100.0));
+        self.settings_mcp(ui);
+        ui.add_space(12.0);
         self.settings_signing(ui);
         ui.add_space(12.0);
         self.card_frame(ui).show(ui, |ui| {
@@ -4379,6 +4644,77 @@ impl AndroidToolApp {
         }
     }
 
+    fn start_mcp(&mut self) {
+        self.mcp = None;
+        self.mcp_error.clear();
+        match crate::mcp::McpService::start(&self.config) {
+            Ok(service) => self.mcp = Some(service),
+            Err(error) => self.mcp_error = error,
+        }
+    }
+
+    fn settings_mcp(&mut self, ui: &mut Ui) {
+        let colors = theme::palette(ui.ctx());
+        self.card_frame(ui).show(ui, |ui| {
+            self.section_title(ui, "本地 MCP", "让本地 agent 通过 Streamable HTTP 操作 Android 设备");
+            ui.label(RichText::new("仅监听 127.0.0.1；免 Token 允许同机其他进程调用。界面操作可能与 agent 同时执行，取消不能撤销已完成的修改。").color(colors.muted).size(11.0));
+            ui.horizontal_wrapped(|ui| {
+                ui.label("端口");
+                if ui.add(egui::DragValue::new(&mut self.config.mcp_port).range(1..=65535)).changed() { self.mark_config_dirty(); }
+                if ui.button("选择共享目录").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        self.config.mcp_share_dir = util::portable_path(&path);
+                        self.mark_config_dirty();
+                    }
+                }
+            });
+            ui.add(egui::Label::new(format!("共享目录：{}", crate::mcp::share_dir(&self.config).display())).wrap());
+            ui.label(RichText::new("端口和共享目录修改后需重启服务。工具链配置在运行时更新；本机文件仅允许共享目录内的相对路径。").size(10.0).color(colors.muted));
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(if self.mcp.is_some() { "重启 MCP" } else { "启动 MCP" }).clicked() {
+                    self.config.mcp_enabled = true;
+                    self.start_mcp();
+                    self.save_config();
+                }
+                if ui.button("停止 MCP").clicked() {
+                    self.mcp = None;
+                    self.config.mcp_enabled = false;
+                    self.mcp_error.clear();
+                    self.save_config();
+                }
+                ui.label(if self.config.mcp_enabled { "已记住启用状态，下次打开自动启动" } else { "已关闭" });
+            });
+            if !self.mcp_error.is_empty() { ui.colored_label(colors.red, &self.mcp_error); }
+            if let Some(service) = &self.mcp {
+                service.update_tools(&self.config);
+                let status = service.status.lock().clone();
+                ui.add(egui::Label::new(format!("状态：{status} · {}", service.url())).wrap());
+                ui.add(egui::Label::new(format!("运行目录：{}", service.root.display())).wrap());
+                if !service.running.load(std::sync::atomic::Ordering::Relaxed) { ui.colored_label(colors.red, "服务未运行，请检查错误后重新启动"); }
+                if ui.button("复制 MCP 客户端 JSON 配置").clicked() {
+                    ui.ctx().copy_text(serde_json::to_string_pretty(&serde_json::json!({"mcpServers":{"androidtool":{"url":service.url()}}})).unwrap());
+                }
+                ui.separator();
+                ui.label("AAB 签名授权（仅本次服务运行有效）");
+                egui::ComboBox::from_id_salt("mcp-signing-profile").selected_text(
+                    self.config.signing_profiles.iter().find(|p| p.id == self.mcp_signing_id).map(|p|p.name.as_str()).unwrap_or("选择签名配置")
+                ).show_ui(ui, |ui| {
+                    for profile in &self.config.signing_profiles { ui.selectable_value(&mut self.mcp_signing_id, profile.id.clone(), &profile.name); }
+                });
+                if let Some(profile) = self.config.signing_profiles.iter_mut().find(|p|p.id == self.mcp_signing_id) {
+                    ui.horizontal(|ui| { ui.label("Keystore 密码"); ui.add(TextEdit::singleline(&mut profile.store_password).password(true).desired_width(200.0)); });
+                    ui.horizontal(|ui| { ui.label("Key 密码（可空）"); ui.add(TextEdit::singleline(&mut profile.key_password).password(true).desired_width(200.0)); });
+                    if ui.button("授权 MCP 使用此签名").clicked() {
+                        self.mcp_error = service.authorize(profile.clone()).err().unwrap_or_default();
+                    }
+                }
+                if let Some(name) = service.authorized_name() {
+                    ui.horizontal(|ui| { ui.label(format!("已授权：{name}")); if ui.button("撤销授权").clicked() { service.revoke(); } });
+                } else { ui.label("未授权：AAB 安装将返回错误，APK / APKS 不受影响"); }
+            }
+        });
+    }
+
     fn settings_signing(&mut self, ui: &mut Ui) {
         let colors = theme::palette(ui.ctx());
         let mut changed = false;
@@ -4607,6 +4943,11 @@ impl AndroidToolApp {
                     .clicked()
                 {
                     self.config = AppConfig::load();
+                    self.mcp = None;
+                    self.mcp_error.clear();
+                    if self.config.mcp_enabled {
+                        self.start_mcp();
+                    }
                     self.tools.java_major = if [17, 21, 25].contains(&self.config.java_major) {
                         self.config.java_major
                     } else {
@@ -5151,6 +5492,18 @@ impl AndroidToolApp {
     fn show_drop_overlay(&self, ctx: &egui::Context) {
         let colors = theme::palette(ctx);
         let hovering = ctx.input(|input| !input.raw.hovered_files.is_empty());
+        if self.page == Page::Installer
+            && self.installer.apk_library_rect.is_some_and(|rect| {
+                ctx.input(|input| {
+                    input
+                        .pointer
+                        .latest_pos()
+                        .is_some_and(|pos| rect.contains(pos))
+                })
+            })
+        {
+            return;
+        }
         let alpha = ctx.animate_bool_with_time(Id::new("drop-overlay"), hovering, 0.14);
         if alpha <= 0.001 {
             return;
@@ -5189,7 +5542,7 @@ impl AndroidToolApp {
         painter.text(
             inner.center() + egui::vec2(0.0, 62.0),
             Align2::CENTER_CENTER,
-            "APK / AAB / APKS 自动进入安装器，其它文件进入文件工作区",
+            "APK 可拖入安装器列表保存；AAB / APKS 进入安装队列",
             FontId::new(11.0, egui::FontFamily::Proportional),
             theme::alpha(colors.muted, alpha),
         );
@@ -6077,6 +6430,44 @@ drwxrwx--- 2 root sdcard_rw 4096 2026-11-11 10:20 Download
         assert!(app.installer.session.is_none());
         assert_eq!(app.installer.queue.len(), 1);
         assert!(app.installer.queue.front().unwrap().signing.is_none());
+    }
+
+    #[test]
+    fn installer_layout_fits_narrow_and_wide_content_areas() {
+        for width in [720.0, 900.0, 1400.0] {
+            let ctx = egui::Context::default();
+            theme::setup(&ctx);
+            let mut app = AndroidToolApp::from_config(AppConfig::default(), false);
+            app.installer.apk_library = (0..4)
+                .map(|index| PathBuf::from(format!("C:/apks/long-application-name-{index}.apk")))
+                .collect();
+            app.installer.logs.push((
+                InstallLogLevel::Output,
+                "12:34:56".into(),
+                "bundletool output ".repeat(15),
+            ));
+            app.installer.active_name = Some("application.aab".into());
+            app.installer.active_kind = Some(PackageKind::Aab);
+            app.installer.stage = "生成通用 APK（bundletool）".into();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 900.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let limit = ui.max_rect();
+                    app.page_installer(ui);
+                    assert!(
+                        ui.min_rect().right() <= limit.right() + 1.0,
+                        "installer layout exceeds width {width}: {:?}",
+                        ui.min_rect()
+                    );
+                });
+            });
+        }
     }
 
     #[test]

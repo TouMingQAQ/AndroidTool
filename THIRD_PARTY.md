@@ -1,5 +1,10 @@
 # Bundled Tools
 
+The installer progress/log presentation and parts of the AAB conversion behavior
+(Universal APK extraction, per-conversion Java scratch directories and scratch
+write-failure diagnosis) reference [TouMingQAQ/AAB2APK](https://github.com/TouMingQAQ/AAB2APK),
+revision `057712be25571379f69436b6a1116ed067124698`.
+
 The Windows portable package redistributes the unmodified official scrcpy 5.0.1
 Windows x64 release alongside Android platform-tools. These are separate
 programs, not linked into the AndroidTool executable.

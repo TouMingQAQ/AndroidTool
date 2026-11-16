@@ -25,6 +25,9 @@ pub struct AppConfig {
     pub log_auto_scroll: bool,
     pub auto_install_drops: bool,
     pub signing_profiles: Vec<SigningProfile>,
+    pub mcp_enabled: bool,
+    pub mcp_port: u16,
+    pub mcp_share_dir: String,
     pub gamepad: GamepadConfig,
 }
 
@@ -49,6 +52,9 @@ impl Default for AppConfig {
             log_auto_scroll: true,
             auto_install_drops: true,
             signing_profiles: Vec::new(),
+            mcp_enabled: false,
+            mcp_port: 18765,
+            mcp_share_dir: String::new(),
             gamepad: GamepadConfig::default(),
         }
     }

@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,10 @@ pub fn cache_dir() -> PathBuf {
 
 pub fn converted_dir() -> PathBuf {
     install_dir().join("converted")
+}
+
+pub fn apk_library_dir() -> PathBuf {
+    install_dir().join("apks")
 }
 
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -54,6 +59,15 @@ pub fn run_cancellable(
     timeout: Duration,
     stop: &AtomicBool,
 ) -> Result<Output, String> {
+    run_cancellable_limited(command, timeout, stop, usize::MAX)
+}
+
+pub fn run_cancellable_limited(
+    command: &mut Command,
+    timeout: Duration,
+    stop: &AtomicBool,
+    limit: usize,
+) -> Result<Output, String> {
     if stop.load(Ordering::Relaxed) {
         return Err("操作已取消".to_owned());
     }
@@ -67,9 +81,23 @@ pub fn run_cancellable(
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let read_pipe = |mut pipe: Box<dyn Read + Send>| {
-        thread::spawn(move || {
+        thread::spawn(move || -> std::io::Result<Vec<u8>> {
             let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes).map(|_| bytes)
+            let mut buffer = [0u8; 8192];
+            let mut overflow = false;
+            loop {
+                let count = pipe.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                let kept = count.min(limit.saturating_sub(bytes.len()));
+                bytes.extend_from_slice(&buffer[..kept]);
+                overflow |= kept < count;
+            }
+            if overflow {
+                return Err(std::io::Error::other("命令输出超过容量限制"));
+            }
+            Ok(bytes)
         })
     };
     let stdout = read_pipe(Box::new(stdout));
@@ -89,6 +117,15 @@ pub fn run_cancellable(
         }
     };
     if result.is_err() {
+        #[cfg(windows)]
+        {
+            // bundletool may have spawned ADB children that inherit the output pipes.
+            let _ = self::command("taskkill.exe")
+                .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -105,6 +142,126 @@ pub fn run_cancellable(
         stdout: stdout?,
         stderr: stderr?,
     })
+}
+
+pub fn run_streaming_limited<F>(
+    command: &mut Command,
+    timeout: Duration,
+    stop: &AtomicBool,
+    limit: usize,
+    mut on_line: F,
+) -> Result<Output, String>
+where
+    F: FnMut(bool, String),
+{
+    if stop.load(Ordering::Relaxed) {
+        return Err("操作已取消".to_owned());
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("无法启动命令: {error}"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = mpsc::channel::<(bool, std::io::Result<Vec<u8>>)>();
+    let spawn_reader = |mut pipe: Box<dyn Read + Send>, is_stderr, tx: mpsc::Sender<_>| {
+        thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(&mut pipe);
+            loop {
+                let mut line = Vec::new();
+                match std::io::BufRead::read_until(&mut reader, b'\n', &mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.send((is_stderr, Ok(line))).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send((is_stderr, Err(error)));
+                        break;
+                    }
+                }
+            }
+        })
+    };
+    let stdout_reader = spawn_reader(Box::new(stdout), false, tx.clone());
+    let stderr_reader = spawn_reader(Box::new(stderr), true, tx.clone());
+    drop(tx);
+
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let started = Instant::now();
+    let mut reader_done = [false; 2];
+    let mut exited = None;
+    let result = loop {
+        if stop.load(Ordering::Relaxed) {
+            break Err("操作已取消".to_owned());
+        }
+        if started.elapsed() >= timeout {
+            break Err(format!("命令超时（{} 秒）", timeout.as_secs()));
+        }
+        match rx.recv_timeout(Duration::from_millis(40)) {
+            Ok((is_stderr, Ok(mut bytes))) => {
+                while bytes
+                    .last()
+                    .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+                {
+                    bytes.pop();
+                }
+                let bytes_count = stdout_bytes.len().saturating_add(stderr_bytes.len());
+                if bytes.len().saturating_add(bytes_count).saturating_add(1) > limit {
+                    break Err("命令输出超过容量限制".to_owned());
+                }
+                let destination = if is_stderr {
+                    &mut stderr_bytes
+                } else {
+                    &mut stdout_bytes
+                };
+                destination.extend_from_slice(&bytes);
+                destination.push(b'\n');
+                let line = String::from_utf8_lossy(&bytes).into_owned();
+                if !line.trim().is_empty() {
+                    on_line(is_stderr, line);
+                }
+            }
+            Ok((_, Err(error))) => break Err(format!("读取命令输出失败: {error}")),
+            Err(RecvTimeoutError::Disconnected) => {
+                reader_done = [true; 2];
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => exited = Some(status),
+            Ok(None) => {}
+            Err(error) => break Err(format!("无法读取命令进程状态: {error}")),
+        }
+        if reader_done == [true; 2] {
+            if let Some(status) = exited {
+                break Ok(Output {
+                    status,
+                    stdout: stdout_bytes,
+                    stderr: stderr_bytes,
+                });
+            }
+        }
+    };
+    if result.is_err() {
+        #[cfg(windows)]
+        {
+            let _ = self::command("taskkill.exe")
+                .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    result
 }
 
 pub fn output_text(output: &Output) -> String {
@@ -416,6 +573,10 @@ mod tests {
                 std::io::stdout().write_all(&vec![b'x'; 131072]).unwrap();
                 std::io::stderr().write_all(&vec![b'y'; 131072]).unwrap();
             }
+            Ok("lines") => {
+                println!("stdout one");
+                eprintln!("stderr one");
+            }
             _ => {}
         }
     }
@@ -465,6 +626,45 @@ mod tests {
             &mut fixture_command("output"),
             Duration::from_secs(5),
             &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.len() >= 131072);
+        assert!(output.stderr.len() >= 131072);
+    }
+
+    #[test]
+    fn streaming_command_delivers_stdout_and_stderr_lines() {
+        let mut lines = Vec::new();
+        let output = run_streaming_limited(
+            &mut fixture_command("lines"),
+            Duration::from_secs(5),
+            &AtomicBool::new(false),
+            1024,
+            |stderr, line| lines.push((stderr, line)),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(
+            lines
+                .iter()
+                .any(|(stderr, line)| !stderr && line.contains("stdout one"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(stderr, line)| *stderr && line.contains("stderr one"))
+        );
+    }
+
+    #[test]
+    fn streaming_command_keeps_output_larger_than_individual_lines_under_limit() {
+        let output = run_streaming_limited(
+            &mut fixture_command("output"),
+            Duration::from_secs(5),
+            &AtomicBool::new(false),
+            300_000,
+            |_, _| {},
         )
         .unwrap();
         assert!(output.status.success());

@@ -1,15 +1,15 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, atomic::AtomicBool};
 use std::thread;
+use std::time::Duration;
 
 use chrono::Local;
 use ring::rand::{SecureRandom, SystemRandom};
 use zip::ZipArchive;
 
-use crate::adb::Adb;
 use crate::config::SigningProfile;
 use crate::util;
 
@@ -57,6 +57,7 @@ pub struct InstallRequest {
     pub convert_only: bool,
     pub output_apk: Option<PathBuf>,
     pub signing: Option<SigningProfile>,
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Debug)]
@@ -65,12 +66,25 @@ pub enum InstallEvent {
         progress: f32,
         stage: String,
     },
-    Log(String),
+    Log {
+        level: InstallLogLevel,
+        line: String,
+    },
+    Converted(PathBuf),
     Finished {
         success: bool,
         message: String,
         converted: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallLogLevel {
+    Step,
+    Success,
+    Warning,
+    Error,
+    Output,
 }
 
 pub struct InstallSession {
@@ -94,7 +108,7 @@ pub fn converted_output_path(package: &Path) -> PathBuf {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("application");
-    let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S-%f");
     util::converted_dir().join(format!("{stem}-{timestamp}-universal.apk"))
 }
 
@@ -130,14 +144,25 @@ fn execute(
     request: InstallRequest,
     sender: &mpsc::Sender<InstallEvent>,
 ) -> Result<Option<PathBuf>, String> {
+    if request
+        .cancel
+        .as_ref()
+        .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        return Err("操作已取消".into());
+    }
     if !request.package.is_file() {
         return Err(format!("安装包不存在：{}", request.package.display()));
     }
     let kind = PackageKind::detect(&request.package);
     let name = util::file_name(&request.package);
-    progress(sender, 0.04, "识别安装包");
-    log(sender, format!("安装包：{name}"));
-    log(sender, format!("类型：{}", kind.label()));
+    progress(sender, 0.04, "检查安装包");
+    log(sender, InstallLogLevel::Step, format!("检查安装包：{name}"));
+    log(
+        sender,
+        InstallLogLevel::Output,
+        format!("类型：{}", kind.label()),
+    );
 
     match kind {
         PackageKind::Apk => {
@@ -146,6 +171,7 @@ fn execute(
         }
         PackageKind::Aab => {
             let converted = convert_aab(&request, sender)?;
+            let _ = sender.send(InstallEvent::Converted(converted.clone()));
             if request.convert_only {
                 Ok(Some(converted))
             } else {
@@ -175,15 +201,45 @@ fn install_apk(
     if !request.adb_path.is_file() {
         return Err("未找到 ADB，请先在设置中配置".to_owned());
     }
-    progress(sender, 0.72, "安装到设备");
+    progress(sender, 0.78, "安装到设备");
     log(
         sender,
-        format!("ADB install → {} ({})", request.serial, apk.display()),
+        InstallLogLevel::Step,
+        format!("安装到设备：{}", request.serial),
     );
-    let adb = Adb::new(&request.adb_path);
-    let output = adb.install(&request.serial, apk)?;
-    log(sender, output);
+    let mut command = util::command(&request.adb_path);
+    command
+        .args(["-s", &request.serial, "install", "-r", "-d"])
+        .arg(apk);
+    let default_stop = AtomicBool::new(false);
+    let stop = request.cancel.as_deref().unwrap_or(&default_stop);
+    let output = util::run_streaming_limited(
+        &mut command,
+        Duration::from_secs(600),
+        stop,
+        16 * 1024 * 1024,
+        |is_stderr, line| {
+            log(
+                sender,
+                if is_stderr {
+                    InstallLogLevel::Warning
+                } else {
+                    InstallLogLevel::Output
+                },
+                line,
+            );
+        },
+    )?;
+    let text = util::output_text(&output);
+    if !output.status.success() || !text.contains("Success") {
+        return Err(if text.is_empty() {
+            "ADB 安装失败".to_owned()
+        } else {
+            text
+        });
+    }
     progress(sender, 1.0, "安装完成");
+    log(sender, InstallLogLevel::Success, "APK 安装成功");
     Ok(())
 }
 
@@ -198,6 +254,7 @@ fn convert_aab(
     signing.validate()?;
     log(
         sender,
+        InstallLogLevel::Step,
         format!(
             "使用签名密钥：{}（别名：{}）",
             signing.name, signing.key_alias
@@ -210,21 +267,33 @@ fn convert_aab(
         return Err("AAB 转换需要 bundletool.jar，请在设置页下载或选择".to_owned());
     }
     util::ensure_dir(&util::cache_dir())?;
-    let stem = request
-        .package
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("application");
-    let temp_apks = util::cache_dir().join(format!(
-        "{}-{}.apks",
-        stem,
-        Local::now().format("%Y%m%d-%H%M%S")
-    ));
+    let output_path = request
+        .output_apk
+        .clone()
+        .unwrap_or_else(|| converted_output_path(&request.package));
+    if output_path.exists() {
+        return Err(format!(
+            "{} 已存在。为避免覆盖已有 APK，请选择其他输出位置。",
+            output_path.display()
+        ));
+    }
+    let scratch = ConversionScratch::new()?;
+    let temp_apks = scratch.path.join("bundle.apks");
+    log(
+        sender,
+        InstallLogLevel::Output,
+        format!("转换缓存：{}", scratch.path.display()),
+    );
 
-    progress(sender, 0.16, "bundletool 构建 Universal APK");
-    log(sender, "正在调用 bundletool build-apks …".to_owned());
+    progress(sender, 0.12, "生成通用 APK（bundletool）");
+    log(
+        sender,
+        InstallLogLevel::Step,
+        "开始生成通用 APK（bundletool build-apks）",
+    );
     let mut command = util::command(&request.java_path);
     command
+        .arg(format!("-Djava.io.tmpdir={}", scratch.path.display()))
         .arg("-jar")
         .arg(&request.bundletool_path)
         .arg("build-apks")
@@ -236,37 +305,113 @@ fn convert_aab(
         .arg(format!("--ks-key-alias={}", signing.key_alias.trim()));
     let passwords = SigningPasswordFiles::new(signing)?;
     passwords.configure(&mut command);
-    let output = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("无法启动 bundletool: {error}"))?;
+    let output = match run_install_command(&mut command, request, sender, Some(signing)) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_apks);
+            return Err(error);
+        }
+    };
     drop(passwords);
 
-    let output_text = signing.redact(&util::output_text(&output));
-    if !output.status.success() {
-        let _ = fs::remove_file(&temp_apks);
-        return Err(format!("bundletool 转换失败：\n{output_text}"));
-    }
-    if !output_text.is_empty() {
-        log(sender, output_text);
+    if request
+        .cancel
+        .as_ref()
+        .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        return Err("操作已取消".into());
     }
 
-    progress(sender, 0.52, "提取 universal.apk");
+    let output_text = signing.redact(&util::output_text(&output));
+    if !output.status.success() || !temp_apks.is_file() {
+        log(sender, InstallLogLevel::Error, "bundletool 转换失败");
+        if looks_like_scratch_write_failure(&output_text) {
+            return Err(format!(
+                "bundletool 无法写入转换缓存（{}），请检查磁盘空间与写入权限。\n{output_text}",
+                scratch.path.display()
+            ));
+        }
+        return Err(format!("bundletool 转换失败：\n{output_text}"));
+    }
+
+    log(
+        sender,
+        InstallLogLevel::Success,
+        "bundletool 已完成通用 APK 构建",
+    );
+    progress(sender, 0.72, "提取 universal.apk");
+    log(
+        sender,
+        InstallLogLevel::Step,
+        "从 APKS 归档提取 universal.apk",
+    );
     util::ensure_dir(&util::converted_dir())?;
-    let output_path = request
-        .output_apk
-        .clone()
-        .unwrap_or_else(|| converted_output_path(&request.package));
     if let Some(parent) = output_path.parent() {
         util::ensure_dir(parent)?;
     }
     extract_universal_apk(&temp_apks, &output_path)?;
-    let _ = fs::remove_file(&temp_apks);
+    if let Err(error) = fs::remove_file(&temp_apks) {
+        log(
+            sender,
+            InstallLogLevel::Warning,
+            format!("无法删除临时 APKS：{error}"),
+        );
+    }
 
-    log(sender, format!("Universal APK：{}", output_path.display()));
-    progress(sender, 0.64, "转换完成");
+    log(
+        sender,
+        InstallLogLevel::Success,
+        format!("APK 已生成：{}", output_path.display()),
+    );
+    progress(sender, 0.78, "AAB 转换完成");
     Ok(output_path)
+}
+
+// Adapted from AAB2APK's per-conversion Java scratch directory and write failure diagnosis.
+fn looks_like_scratch_write_failure(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("unable to sign apk")
+        && [
+            "filedispatcherimpl.write0",
+            "filechannelimpl.write",
+            "randomaccessdatasink",
+        ]
+        .iter()
+        .any(|frame| lower.contains(frame))
+}
+
+struct ConversionScratch {
+    path: PathBuf,
+    root: PathBuf,
+}
+
+impl ConversionScratch {
+    fn new() -> Result<Self, String> {
+        let root = fs::canonicalize(util::cache_dir()).map_err(|error| error.to_string())?;
+        let mut random = [0; 16];
+        SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| "无法生成转换缓存目录名")?;
+        let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = root.join(format!("aab-{name}"));
+        fs::create_dir(&path).map_err(|error| format!("无法创建转换缓存：{error}"))?;
+        Ok(Self { path, root })
+    }
+}
+
+impl Drop for ConversionScratch {
+    fn drop(&mut self) {
+        // Resolve the final target before recursive removal and require our cache directory.
+        if let Ok(resolved) = fs::canonicalize(&self.path) {
+            if resolved.parent() == Some(self.root.as_path())
+                && resolved
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("aab-"))
+            {
+                let _ = fs::remove_dir_all(resolved);
+            }
+        }
+    }
 }
 
 struct PasswordFile {
@@ -346,24 +491,49 @@ fn extract_universal_apk(apks_path: &Path, output_apk: &Path) -> Result<(), Stri
         .map_err(|error| format!("无法打开 APKS {}: {error}", apks_path.display()))?;
     let mut archive =
         ZipArchive::new(file).map_err(|error| format!("APKS 不是有效 ZIP: {error}"))?;
+    let entry_name = archive
+        .file_names()
+        .find(|name| name.eq_ignore_ascii_case("universal.apk"))
+        .or_else(|| {
+            archive
+                .file_names()
+                .find(|name| name.to_ascii_lowercase().ends_with("/universal.apk"))
+        })
+        .ok_or("APKS 中未找到 universal.apk，请确认已使用 universal 模式")?
+        .to_owned();
     let mut entry = archive
-        .by_name("universal.apk")
-        .map_err(|_| "APKS 中未找到 universal.apk，请确认已使用 universal 模式".to_owned())?;
-    let mut output = File::create(output_apk)
+        .by_name(&entry_name)
+        .map_err(|error| error.to_string())?;
+    if entry.size() == 0 {
+        return Err("APKS 中的 universal.apk 为空".into());
+    }
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output_apk)
         .map_err(|error| format!("无法创建 APK {}: {error}", output_apk.display()))?;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = entry
-            .read(&mut buffer)
-            .map_err(|error| format!("读取 universal.apk 失败: {error}"))?;
-        if read == 0 {
-            break;
+    let result = (|| {
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = entry
+                .read(&mut buffer)
+                .map_err(|error| format!("读取 universal.apk 失败: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(|error| format!("写入 APK 失败: {error}"))?;
         }
         output
-            .write_all(&buffer[..read])
-            .map_err(|error| format!("写入 APK 失败: {error}"))?;
+            .flush()
+            .map_err(|error| format!("刷新 APK 失败: {error}"))
+    })();
+    drop(output);
+    if result.is_err() {
+        let _ = fs::remove_file(output_apk);
     }
-    Ok(())
+    result
 }
 
 fn install_apks(
@@ -377,7 +547,11 @@ fn install_apks(
         return Err("安装 APKS 需要 Java 与 bundletool".to_owned());
     }
     progress(sender, 0.35, "安装 APKS");
-    log(sender, "正在调用 bundletool install-apks …".to_owned());
+    log(
+        sender,
+        InstallLogLevel::Step,
+        "开始安装 APKS（bundletool install-apks）",
+    );
     let adb_folder = request
         .adb_path
         .parent()
@@ -388,25 +562,51 @@ fn install_apks(
     paths.extend(std::env::split_paths(&path_env));
     let joined_path = std::env::join_paths(paths).map_err(|error| error.to_string())?;
 
-    let output = util::command(&request.java_path)
+    let mut command = util::command(&request.java_path);
+    command
         .arg("-jar")
         .arg(&request.bundletool_path)
         .arg("install-apks")
         .arg(format!("--apks={}", request.package.display()))
         .arg(format!("--device-id={}", request.serial))
-        .env("PATH", joined_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("无法启动 bundletool: {error}"))?;
+        .env("PATH", joined_path);
+    let output = run_install_command(&mut command, request, sender, None)?;
 
     let text = util::output_text(&output);
     if !output.status.success() {
         return Err(format!("APKS 安装失败：\n{text}"));
     }
-    log(sender, text);
     progress(sender, 1.0, "安装完成");
+    log(sender, InstallLogLevel::Success, "APKS 安装成功");
     Ok(())
+}
+
+fn run_install_command(
+    command: &mut std::process::Command,
+    request: &InstallRequest,
+    sender: &mpsc::Sender<InstallEvent>,
+    signing: Option<&SigningProfile>,
+) -> Result<std::process::Output, String> {
+    let default_stop = AtomicBool::new(false);
+    let stop = request.cancel.as_deref().unwrap_or(&default_stop);
+    util::run_streaming_limited(
+        command,
+        Duration::from_secs(1800),
+        stop,
+        16 * 1024 * 1024,
+        |is_stderr, line| {
+            let line = signing.map_or(line.clone(), |profile| profile.redact(&line));
+            log(
+                sender,
+                if is_stderr {
+                    InstallLogLevel::Warning
+                } else {
+                    InstallLogLevel::Output
+                },
+                line,
+            );
+        },
+    )
 }
 
 fn progress(sender: &mpsc::Sender<InstallEvent>, value: f32, stage: impl Into<String>) {
@@ -416,8 +616,11 @@ fn progress(sender: &mpsc::Sender<InstallEvent>, value: f32, stage: impl Into<St
     });
 }
 
-fn log(sender: &mpsc::Sender<InstallEvent>, line: impl Into<String>) {
-    let _ = sender.send(InstallEvent::Log(line.into()));
+fn log(sender: &mpsc::Sender<InstallEvent>, level: InstallLogLevel, line: impl Into<String>) {
+    let _ = sender.send(InstallEvent::Log {
+        level,
+        line: line.into(),
+    });
 }
 
 #[cfg(test)]
@@ -528,7 +731,36 @@ mod tests {
 
         extract_universal_apk(&apks_path, &output_path).unwrap();
         assert_eq!(fs::read(&output_path).unwrap(), b"test-apk");
+        assert!(extract_universal_apk(&apks_path, &output_path).is_err());
+        assert_eq!(fs::read(&output_path).unwrap(), b"test-apk");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extracts_nested_universal_and_detects_scratch_write_failure() {
+        let root =
+            std::env::temp_dir().join(format!("androidtool-nested-apks-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("bundle.apks");
+        let output_path = root.join("universal.apk");
+        let mut archive = zip::ZipWriter::new(File::create(&archive_path).unwrap());
+        archive
+            .start_file(
+                "output/universal.apk",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(b"apk-data").unwrap();
+        archive.finish().unwrap();
+        extract_universal_apk(&archive_path, &output_path).unwrap();
+        assert_eq!(fs::read(&output_path).unwrap(), b"apk-data");
+        assert!(looks_like_scratch_write_failure(
+            "Unable to sign APK\nFileDispatcherImpl.write0"
+        ));
+        assert!(!looks_like_scratch_write_failure(
+            "Unable to sign APK: wrong password"
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod adb;
+mod apk_library;
 mod app;
 mod branding;
 mod config;
@@ -10,6 +11,7 @@ mod gamepad_hid;
 mod gamepad_view;
 mod installer;
 mod logcat;
+mod mcp;
 mod mirror;
 #[cfg(windows)]
 mod mirror_window;

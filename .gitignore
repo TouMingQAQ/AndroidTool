@@ -1,5 +1,6 @@
 /target
 /converted
+/apks
 /cache
 /*.settings.json
 *.log
@@ -7,6 +8,7 @@
 /vendor
 /dist
 /tools
+/mcp-share
 .env
 .env.*
 *.jks

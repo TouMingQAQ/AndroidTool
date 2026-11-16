@@ -19,8 +19,9 @@ AndroidTool 是一个使用 Rust + egui 编写的便携式 Android 工具台。
 - 基于官方 scrcpy 的 H.264 低延迟投屏与鼠标键盘控制，保留内嵌 ADB 截图兼容模式
 - Logcat 使用统一应用选择器，自动扫描前台和运行中的包名；默认自动选择前台应用，也可从列表固定选择、搜索或输入包名（含子进程），支持全部日志、级别/关键字过滤和导入导出
 - APK / AAB 统一安装器，AAB 自动通过 bundletool 转换后安装；支持多组 keystore 签名配置，每个 AAB 执行前选择密钥
-- APKS 安装、AAB 仅转换、顺序安装队列与转换产物保留
+- APKS 安装、AAB 仅转换、顺序安装队列与持久 APK 列表；转换后的 APK 可留存以便重复安装，也可拖入 APK 列表导入
 - 文件拖拽、设备文件浏览、上传和下载
+- 本地 MCP Streamable HTTP 服务，供 agent 调用设备观察、输入、安装及文件传输工具
 - Xbox / PlayStation / Nintendo / 通用手柄识别，通过 UHID 向 Android 发送原生手柄输入
 - 虚拟手柄、双摇杆、方向键与扳机，支持按住和组合键
 - 设置页支持深色、浅色和跟随系统主题，主题选择自动保存
@@ -35,6 +36,26 @@ AndroidTool 是一个使用 Rust + egui 编写的便携式 Android 工具台。
 5. 安装 AAB 前，在设置页下载或指定 bundletool 和 Java 17+；仅安装 APK 不需要这两项。
 
 Windows ZIP 便携包和 Setup 安装包均包含 ADB 与 scrcpy，但不预装 Java 和 bundletool。Setup 默认安装到当前用户的 `%LOCALAPPDATA%\Programs\AndroidTool`，无需管理员权限，提供开始菜单入口、可选桌面快捷方式和卸载入口。卸载不主动删除个人配置、下载工具和缓存。未发布二进制包时，可按下文自行构建。
+
+## 本地 MCP
+
+在设置页的“本地 MCP”中启动服务，并可选择共享目录和端口。服务默认关闭；启动后会记住启用状态，下次打开 AndroidTool 自动启动。关闭应用或点击“停止 MCP”即停止服务；端口和共享目录修改后需重启服务。默认地址为 `http://127.0.0.1:18765/mcp`，设置页可直接复制配置：
+
+```json
+{
+  "mcpServers": {
+    "androidtool": {
+      "url": "http://127.0.0.1:18765/mcp"
+    }
+  }
+}
+```
+
+本服务使用 MCP Streamable HTTP，不提供 stdio 或旧版 SSE 端点；客户端必须支持 HTTP MCP。agent 应先调用 `list_devices`，设备操作每次都显式传入 `serial`。工具包括设备信息、截图、UI XML、点击滑动、按键、ASCII 文本、应用列表和启动／停止、有限 Logcat、安装包及文件传输，不提供任意 shell。坐标使用设备像素。`install_package` 返回 `operation_id`，通过 `get_operation` 查询或通过 `cancel_operation` 取消；取消无法撤销已经完成的设备修改。
+
+安装包、上传源和下载目标必须是共享目录内的相对路径；默认目录是程序目录下的 `mcp-share/`，下载不会覆盖已有文件。AAB 转换产物写入共享目录的 `converted/`。AAB 安装须在设置页选择已有签名配置、输入会话密码并点击“授权 MCP 使用此签名”；服务重启后需重新授权。密码不会通过 MCP 传入或返回，也不会写入设置文件。APKS 和 AAB 需要 Java 与 bundletool。
+
+**安全提示：** 服务只绑定本机但没有 Token，同一台电脑上的其他进程也可以调用这些工具；网页 Origin 和非本机 Host 会被拒绝。不使用时请停止服务。共享目录内的文件可被本地客户端读取或写入，且界面和 agent 可能同时操作设备；请仅将可共享的数据放入该目录。屏幕截图、UI 树和日志可能包含敏感信息。
 
 推送版本标签（例如 `v0.0.1`，需与 Cargo 版本一致）后，GitHub Actions 会在 Windows 上测试并构建，随后发布 ZIP、Setup EXE 及各自的 SHA-256 文件到 GitHub Releases；也可以手动运行工作流获取构建产物。
 
@@ -113,6 +134,8 @@ Keystore 密码和密钥密码仅在当前运行会话内保留，不写入配�
 可进入“管理密钥”添加、修改配置，再点击“返回待签名任务”继续；取消仅移除当前任务。
 APK / APKS 已签名，不会重新签名，也不需要选择密钥。
 
+安装器中的“APK 列表”会显示 `converted/` 下的 AAB 转换产物，以及 `apks/` 下导入保存的 APK。转换后的 APK 会保留，即使安装失败也可在列表中勾选后重试。可将一个或多个 APK 拖到列表区域或点击“添加 APK”复制入库；选择多项后按顺序安装到当前选中的设备。相同内容不会重复导入，同名但内容不同的 APK 会另存，不覆盖已有文件。
+
 bundletool 使用短期密码文件读取密码，不将密码放入命令行，调用结束后清理文件；Windows 文件句柄关闭时自动删除。
 日志对密码做脱敏处理。密码仍存在于应用和子进程内存中，请只在可信电脑上操作。
 要覆盖设备上已有应用，必须使用与其签名一致的应用签名密钥；Google Play 的上传密钥不一定是实际分发的应用签名密钥。
@@ -172,6 +195,8 @@ LT / RT 同时上报模拟扳机轴和原生 L2 / R2 按键（半程阈值），
 AAB 安装需要 Java 17+。AndroidTool 会调用 bundletool 构建 universal APK，再通过 ADB
 安装到当前目标设备。转换后的 APK 也会保留在安装目录的 `converted/` 中。
 
+转换与安装进度参考 [AAB2APK](https://github.com/TouMingQAQ/AAB2APK) 的步骤清单和实时日志：区分当前步骤、成功、警告与错误，日志带时间戳，可复制、清空和控制自动滚动。转换实现参考其 Universal APK 提取、独立 Java 临时目录与磁盘写入故障诊断；当前仍由 bundletool 使用所选 keystore 完成签名，不额外执行 zipalign 或 apksigner。
+
 设置页可以分别下载 ADB、bundletool 和 Eclipse Temurin Java 运行时。bundletool 可从官方发布版本中选择；Java 支持选择 17、21、25 LTS 及对应的具体发行版本。先点击“获取版本”，选择版本后点击“下载”。三个工具各自使用独立进程，可分别取消，成功后自动更新工具路径。Java 下载功能目前支持官方 ZIP 发行包；macOS / Linux 的 tar.gz 发行包请手动安装并指定路径。
 
 下载代理支持 `http://主机:端口` 的 HTTP CONNECT 或混合代理端口，留空为直连；该设置只影响工具下载和版本查询，不影响 ADB 连接。代理地址明文保存在配置文件中，请勿填写敏感凭据。Java 下载校验官方 SHA-256；bundletool 在上游提供 SHA-256 时校验，ADB 下载使用 HTTPS 并验证可执行文件。
@@ -188,6 +213,7 @@ bundletool 官方 API 不可用时，会尝试 GitHub 的官方发布订阅源�
 - `tools/adb/`：应用内下载的 ADB
 - `cache/`：AAB 转换临时文件
 - `converted/`：转换后的 universal APK
+- `apks/`：导入保存、可重复安装的 APK
 
 下载完成后，安装目录内的工具路径以相对路径保存；移动便携目录时请一并保留配置文件与 `tools/`。重复下载会先询问是否覆盖，并在下载和校验成功后替换旧目录。旧版 `tools/downloads/` 目录及配置仍可继续使用。
 
