@@ -293,15 +293,21 @@ fn convert_aab(
     );
     let mut command = util::command(&request.java_path);
     command
-        .arg(format!("-Djava.io.tmpdir={}", scratch.path.display()))
+        .arg(format!(
+            "-Djava.io.tmpdir={}",
+            java_path_argument(&scratch.path)
+        ))
         .arg("-jar")
-        .arg(&request.bundletool_path)
+        .arg(java_path_argument(&request.bundletool_path))
         .arg("build-apks")
-        .arg(format!("--bundle={}", request.package.display()))
-        .arg(format!("--output={}", temp_apks.display()))
+        .arg(format!("--bundle={}", java_path_argument(&request.package)))
+        .arg(format!("--output={}", java_path_argument(&temp_apks)))
         .arg("--mode=universal")
         .arg("--overwrite")
-        .arg(format!("--ks={}", signing.resolved_keystore().display()))
+        .arg(format!(
+            "--ks={}",
+            java_path_argument(&signing.resolved_keystore())
+        ))
         .arg(format!("--ks-key-alias={}", signing.key_alias.trim()));
     let passwords = SigningPasswordFiles::new(signing)?;
     passwords.configure(&mut command);
@@ -365,6 +371,29 @@ fn convert_aab(
     );
     progress(sender, 0.78, "AAB 转换完成");
     Ok(output_path)
+}
+
+// Rust canonicalize returns verbatim Windows paths, which Java's WindowsPathParser rejects.
+// Convert only at the Java boundary; retain canonical paths for Rust I/O and cleanup checks.
+fn java_path_argument(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc}");
+        }
+        if let Some(dos) = path.strip_prefix(r"\\?\") {
+            let bytes = dos.as_bytes();
+            if bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes[2] == b'\\'
+            {
+                return dos.to_owned();
+            }
+        }
+    }
+    path.into_owned()
 }
 
 // Adapted from AAB2APK's per-conversion Java scratch directory and write failure diagnosis.
@@ -481,8 +510,14 @@ impl SigningPasswordFiles {
 
     fn configure(&self, command: &mut std::process::Command) {
         command
-            .arg(format!("--ks-pass=file:{}", self.store.path.display()))
-            .arg(format!("--key-pass=file:{}", self.key.path.display()));
+            .arg(format!(
+                "--ks-pass=file:{}",
+                java_path_argument(&self.store.path)
+            ))
+            .arg(format!(
+                "--key-pass=file:{}",
+                java_path_argument(&self.key.path)
+            ));
     }
 }
 
@@ -565,9 +600,9 @@ fn install_apks(
     let mut command = util::command(&request.java_path);
     command
         .arg("-jar")
-        .arg(&request.bundletool_path)
+        .arg(java_path_argument(&request.bundletool_path))
         .arg("install-apks")
-        .arg(format!("--apks={}", request.package.display()))
+        .arg(format!("--apks={}", java_path_argument(&request.package)))
         .arg(format!("--device-id={}", request.serial))
         .env("PATH", joined_path);
     let output = run_install_command(&mut command, request, sender, None)?;
@@ -626,6 +661,34 @@ fn log(sender: &mpsc::Sender<InstallEvent>, level: InstallLogLevel, line: impl I
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_paths_preserve_normal_paths() {
+        for path in [
+            r"E:\AndroidTool\cache\bundle.apks",
+            "relative/中文 path.aab",
+        ] {
+            assert_eq!(java_path_argument(Path::new(path)), path);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn java_paths_remove_verbatim_disk_and_unc_prefixes() {
+        for (input, expected) in [
+            (
+                r"\\?\E:\AndroidTool\cache\aab-test\bundle.apks",
+                r"E:\AndroidTool\cache\aab-test\bundle.apks",
+            ),
+            (r"\\?\C:\中文 目录\signing.jks", r"C:\中文 目录\signing.jks"),
+            (
+                r"\\?\UNC\server\share\中文 path\bundle.apks",
+                r"\\server\share\中文 path\bundle.apks",
+            ),
+        ] {
+            assert_eq!(java_path_argument(Path::new(input)), expected);
+        }
+    }
 
     #[test]
     fn signing_password_files_are_private_ephemeral_and_not_in_arguments() {
@@ -687,8 +750,14 @@ mod tests {
         let source = passwords.store.path.with_extension("java");
         fs::write(&source, "import java.nio.file.*; class ReadPassword { public static void main(String[] args) throws Exception { System.out.write(Files.readAllBytes(Path.of(args[0]))); } }").unwrap();
         let output = util::command("java")
-            .arg(&source)
-            .arg(&passwords.store.path)
+            .arg(format!(
+                "-Djava.io.tmpdir={}",
+                java_path_argument(&fs::canonicalize(source.parent().unwrap()).unwrap())
+            ))
+            .arg(java_path_argument(&fs::canonicalize(&source).unwrap()))
+            .arg(java_path_argument(
+                &fs::canonicalize(&passwords.store.path).unwrap(),
+            ))
             .output()
             .unwrap();
         let _ = fs::remove_file(source);
