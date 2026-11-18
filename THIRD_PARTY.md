@@ -44,3 +44,21 @@ AndroidTool can download official bundletool releases from Google and Eclipse
 Temurin Java runtimes from Adoptium on demand. These are not included in the
 portable package; their respective distributions and licenses are provided by
 their upstream projects.
+
+## APK signature support
+
+The application embeds the unmodified official Android `apksig` 8.13.0
+library from Google's Maven repository (`assets/signing/apksig-8.13.0.jar`)
+under Apache License 2.0; its license is included as
+`assets/signing/apksig-LICENSE.txt`. SHA-256:
+`c070ed1394629d74641aa0906f60b2ffa1ee77e6366a1f93437f59717b1aeb89`.
+
+Official artifact: https://dl.google.com/dl/android/maven2/com/android/tools/build/apksig/8.13.0/apksig-8.13.0.jar
+
+`assets/signing/androidtool-signing.jar` is the AndroidTool helper built from
+`java/AndroidToolSigner.java` against that library. Rebuild it with JDK 17+
+using `scripts/build-signing-helper.ps1`.
+With JDK 17+ and Python 3, run `python scripts/test-signing-helper.py path/to/large.apk`
+against an APK larger than 2 GiB to exercise the signing regression. It uses a
+temporary test keystore, checks output signatures and alignment, and leaves the
+input APK unchanged.

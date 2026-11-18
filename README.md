@@ -195,7 +195,7 @@ LT / RT 同时上报模拟扳机轴和原生 L2 / R2 按键（半程阈值），
 AAB 安装需要 Java 17+。AndroidTool 会调用 bundletool 构建 universal APK，再通过 ADB
 安装到当前目标设备。转换后的 APK 也会保留在安装目录的 `converted/` 中。
 
-转换与安装进度参考 [AAB2APK](https://github.com/TouMingQAQ/AAB2APK) 的步骤清单和实时日志：区分当前步骤、成功、警告与错误，日志带时间戳，可复制、清空和控制自动滚动。转换实现参考其 Universal APK 提取、独立 Java 临时目录与磁盘写入故障诊断；当前仍由 bundletool 使用所选 keystore 完成签名，不额外执行 zipalign 或 apksigner。
+转换与安装进度参考 [AAB2APK](https://github.com/TouMingQAQ/AAB2APK) 的步骤清单和实时日志：区分当前步骤、成功、警告与错误，日志带时间戳，可复制、清空和控制自动滚动。转换实现参考其 Universal APK 提取、独立 Java 临时目录与磁盘写入故障诊断。大于 2 GiB 的 Universal APK 会使用所选 keystore 重新签名，并关闭 Android 16 当前无法处理的大文件 APK verity 摘要；程序内置官方 apksig，无需额外安装 Android SDK。
 
 设置页可以分别下载 ADB、bundletool 和 Eclipse Temurin Java 运行时。bundletool 可从官方发布版本中选择；Java 支持选择 17、21、25 LTS 及对应的具体发行版本。先点击“获取版本”，选择版本后点击“下载”。三个工具各自使用独立进程，可分别取消，成功后自动更新工具路径。Java 下载功能目前支持官方 ZIP 发行包；macOS / Linux 的 tar.gz 发行包请手动安装并指定路径。
 

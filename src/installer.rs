@@ -355,7 +355,8 @@ fn convert_aab(
     if let Some(parent) = output_path.parent() {
         util::ensure_dir(parent)?;
     }
-    extract_universal_apk(&temp_apks, &output_path)?;
+    let universal_apk = scratch.path.join("universal.apk");
+    extract_universal_apk(&temp_apks, &universal_apk)?;
     if let Err(error) = fs::remove_file(&temp_apks) {
         log(
             sender,
@@ -363,6 +364,31 @@ fn convert_aab(
             format!("无法删除临时 APKS：{error}"),
         );
     }
+    // Android's APK verity implementation converts the signing-block offset to i32.
+    // Universal APKs larger than 2 GiB must use ordinary v2/v3 content digests.
+    let apk = if fs::metadata(&universal_apk)
+        .map_err(|error| error.to_string())?
+        .len()
+        > i32::MAX as u64
+    {
+        progress(sender, 0.74, "修复大 APK 签名兼容性");
+        log(
+            sender,
+            InstallLogLevel::Step,
+            "APK 超过 2 GiB：使用同一密钥重新签名，保留 v2/v3 并禁用 APK verity",
+        );
+        sign_large_apk(request, signing, &scratch.path, &universal_apk, sender)?
+    } else {
+        universal_apk
+    };
+    if request
+        .cancel
+        .as_ref()
+        .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        return Err("操作已取消".into());
+    }
+    publish_apk(&apk, &output_path)?;
 
     log(
         sender,
@@ -371,6 +397,79 @@ fn convert_aab(
     );
     progress(sender, 0.78, "AAB 转换完成");
     Ok(output_path)
+}
+
+fn sign_large_apk(
+    request: &InstallRequest,
+    signing: &SigningProfile,
+    scratch: &Path,
+    input: &Path,
+    sender: &mpsc::Sender<InstallEvent>,
+) -> Result<PathBuf, String> {
+    let helper = scratch.join("androidtool-signing.jar");
+    let library = scratch.join("apksig-8.13.0.jar");
+    fs::write(
+        &helper,
+        include_bytes!("../assets/signing/androidtool-signing.jar"),
+    )
+    .and_then(|_| {
+        fs::write(
+            &library,
+            include_bytes!("../assets/signing/apksig-8.13.0.jar"),
+        )
+    })
+    .map_err(|error| format!("无法准备 APK 签名组件：{error}"))?;
+    let classpath = std::env::join_paths([
+        PathBuf::from(java_path_argument(&helper)),
+        PathBuf::from(java_path_argument(&library)),
+    ])
+    .map_err(|error| format!("APK 签名组件路径无效：{error}"))?;
+    let output_apk = scratch.join("universal-compatible.apk");
+    let passwords = SigningPasswordFiles::new(signing)?;
+    let mut command = util::command(&request.java_path);
+    command
+        .arg(format!("-Djava.io.tmpdir={}", java_path_argument(scratch)))
+        .arg("-cp")
+        .arg(classpath)
+        .arg("AndroidToolSigner")
+        .arg(java_path_argument(input))
+        .arg(java_path_argument(&output_apk))
+        .arg(java_path_argument(&signing.resolved_keystore()))
+        .arg(signing.key_alias.trim())
+        .arg(java_path_argument(&passwords.store.path))
+        .arg(java_path_argument(&passwords.key.path));
+    let output = run_install_command(&mut command, request, sender, Some(signing))?;
+    if !output.status.success() || !output_apk.is_file() {
+        return Err(format!(
+            "APK 大文件兼容签名或校验失败：\n{}",
+            signing.redact(&util::output_text(&output))
+        ));
+    }
+    log(
+        sender,
+        InstallLogLevel::Success,
+        "大 APK v2/v3 签名及签名证书校验通过",
+    );
+    Ok(output_apk)
+}
+
+fn publish_apk(source: &Path, destination: &Path) -> Result<(), String> {
+    // Reserve the destination exclusively, including when it appeared during conversion.
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| format!("无法创建 APK {}: {error}", destination.display()))?;
+    let result = (|| -> std::io::Result<()> {
+        std::io::copy(&mut File::open(source)?, &mut output)?;
+        output.flush()
+    })();
+    drop(output);
+    if let Err(error) = result {
+        let _ = fs::remove_file(destination);
+        return Err(format!("保存 APK 失败：{error}"));
+    }
+    Ok(())
 }
 
 // Rust canonicalize returns verbatim Windows paths, which Java's WindowsPathParser rejects.
@@ -661,6 +760,24 @@ fn log(sender: &mpsc::Sender<InstallEvent>, level: InstallLogLevel, line: impl I
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publishes_apk_without_overwriting_and_cleans_failed_output() {
+        let scratch = ConversionScratch::new().unwrap();
+        let source = scratch.path.join("source.apk");
+        let output = scratch.path.join("published.apk");
+        fs::write(&source, b"verified-apk").unwrap();
+        publish_apk(&source, &output).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"verified-apk");
+
+        fs::write(&source, b"replacement").unwrap();
+        assert!(publish_apk(&source, &output).is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"verified-apk");
+
+        let failed_output = scratch.path.join("failed.apk");
+        assert!(publish_apk(&scratch.path.join("missing.apk"), &failed_output).is_err());
+        assert!(!failed_output.exists());
+    }
 
     #[test]
     fn java_paths_preserve_normal_paths() {
