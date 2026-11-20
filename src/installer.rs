@@ -109,7 +109,7 @@ pub fn converted_output_path(package: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("application");
     let timestamp = Local::now().format("%Y%m%d-%H%M%S-%f");
-    util::converted_dir().join(format!("{stem}-{timestamp}-universal.apk"))
+    util::apk_library_dir().join(format!("{stem}-{timestamp}-universal.apk"))
 }
 
 fn run_install(request: InstallRequest, sender: mpsc::Sender<InstallEvent>) {
@@ -351,7 +351,7 @@ fn convert_aab(
         InstallLogLevel::Step,
         "从 APKS 归档提取 universal.apk",
     );
-    util::ensure_dir(&util::converted_dir())?;
+    util::ensure_dir(&util::apk_library_dir())?;
     if let Some(parent) = output_path.parent() {
         util::ensure_dir(parent)?;
     }
@@ -364,23 +364,13 @@ fn convert_aab(
             format!("无法删除临时 APKS：{error}"),
         );
     }
-    // Android's APK verity implementation converts the signing-block offset to i32.
-    // Universal APKs larger than 2 GiB must use ordinary v2/v3 content digests.
-    let apk = if fs::metadata(&universal_apk)
-        .map_err(|error| error.to_string())?
-        .len()
-        > i32::MAX as u64
-    {
-        progress(sender, 0.74, "修复大 APK 签名兼容性");
-        log(
-            sender,
-            InstallLogLevel::Step,
-            "APK 超过 2 GiB：使用同一密钥重新签名，保留 v2/v3 并禁用 APK verity",
-        );
-        sign_large_apk(request, signing, &scratch.path, &universal_apk, sender)?
-    } else {
-        universal_apk
-    };
+    progress(sender, 0.74, "调整 APK 签名兼容性");
+    log(
+        sender,
+        InstallLogLevel::Step,
+        "使用同一密钥重新签名 Universal APK，保留 v2/v3 并禁用可能导致系统整数溢出的 APK verity",
+    );
+    let apk = sign_compatible_apk(request, signing, &scratch.path, &universal_apk, sender)?;
     if request
         .cancel
         .as_ref()
@@ -399,7 +389,7 @@ fn convert_aab(
     Ok(output_path)
 }
 
-fn sign_large_apk(
+fn sign_compatible_apk(
     request: &InstallRequest,
     signing: &SigningProfile,
     scratch: &Path,
@@ -441,14 +431,14 @@ fn sign_large_apk(
     let output = run_install_command(&mut command, request, sender, Some(signing))?;
     if !output.status.success() || !output_apk.is_file() {
         return Err(format!(
-            "APK 大文件兼容签名或校验失败：\n{}",
+            "APK 兼容签名或校验失败：\n{}",
             signing.redact(&util::output_text(&output))
         ));
     }
     log(
         sender,
         InstallLogLevel::Success,
-        "大 APK v2/v3 签名及签名证书校验通过",
+        "APK v2/v3 签名及签名证书校验通过（APK verity 已关闭）",
     );
     Ok(output_apk)
 }

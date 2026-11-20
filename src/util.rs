@@ -23,10 +23,6 @@ pub fn cache_dir() -> PathBuf {
     install_dir().join("cache")
 }
 
-pub fn converted_dir() -> PathBuf {
-    install_dir().join("converted")
-}
-
 pub fn apk_library_dir() -> PathBuf {
     install_dir().join("apks")
 }

@@ -134,7 +134,7 @@ Keystore 密码和密钥密码仅在当前运行会话内保留，不写入配�
 可进入“管理密钥”添加、修改配置，再点击“返回待签名任务”继续；取消仅移除当前任务。
 APK / APKS 已签名，不会重新签名，也不需要选择密钥。
 
-安装器中的“APK 列表”会显示 `converted/` 下的 AAB 转换产物，以及 `apks/` 下导入保存的 APK。转换后的 APK 会保留，即使安装失败也可在列表中勾选后重试。可将一个或多个 APK 拖到列表区域或点击“添加 APK”复制入库；选择多项后按顺序安装到当前选中的设备。相同内容不会重复导入，同名但内容不同的 APK 会另存，不覆盖已有文件。
+安装器中的“APK 列表”统一读取 `apks/`，包括 AAB 转换产物和导入保存的 APK。转换后的 APK 会保留，即使安装失败也可在列表中勾选后重试。可将一个或多个 APK 拖到列表区域或点击“添加 APK”复制入库；选择多项后按顺序安装到当前选中的设备。相同内容不会重复导入，同名但内容不同的 APK 会另存，不覆盖已有文件。
 
 bundletool 使用短期密码文件读取密码，不将密码放入命令行，调用结束后清理文件；Windows 文件句柄关闭时自动删除。
 日志对密码做脱敏处理。密码仍存在于应用和子进程内存中，请只在可信电脑上操作。
@@ -193,9 +193,9 @@ LT / RT 同时上报模拟扳机轴和原生 L2 / R2 按键（半程阈值），
 ## AAB 安装
 
 AAB 安装需要 Java 17+。AndroidTool 会调用 bundletool 构建 universal APK，再通过 ADB
-安装到当前目标设备。转换后的 APK 也会保留在安装目录的 `converted/` 中。
+安装到当前目标设备。转换后的 APK 会保留在安装目录的 `apks/` 中，并显示在同一 APK 列表内。
 
-转换与安装进度参考 [AAB2APK](https://github.com/TouMingQAQ/AAB2APK) 的步骤清单和实时日志：区分当前步骤、成功、警告与错误，日志带时间戳，可复制、清空和控制自动滚动。转换实现参考其 Universal APK 提取、独立 Java 临时目录与磁盘写入故障诊断。大于 2 GiB 的 Universal APK 会使用所选 keystore 重新签名，并关闭 Android 16 当前无法处理的大文件 APK verity 摘要；程序内置官方 apksig，无需额外安装 Android SDK。
+转换与安装进度参考 [AAB2APK](https://github.com/TouMingQAQ/AAB2APK) 的步骤清单和实时日志：区分当前步骤、成功、警告与错误，日志带时间戳，可复制、清空和控制自动滚动。转换实现参考其 Universal APK 提取、独立 Java 临时目录与磁盘写入故障诊断。Universal APK 会使用所选 keystore 重新签名并关闭 APK verity 摘要，以兼容 Android 安装器可能发生的整数溢出；程序内置官方 apksig，无需额外安装 Android SDK。
 
 设置页可以分别下载 ADB、bundletool 和 Eclipse Temurin Java 运行时。bundletool 可从官方发布版本中选择；Java 支持选择 17、21、25 LTS 及对应的具体发行版本。先点击“获取版本”，选择版本后点击“下载”。三个工具各自使用独立进程，可分别取消，成功后自动更新工具路径。Java 下载功能目前支持官方 ZIP 发行包；macOS / Linux 的 tar.gz 发行包请手动安装并指定路径。
 
@@ -212,7 +212,6 @@ bundletool 官方 API 不可用时，会尝试 GitHub 的官方发布订阅源�
 - `tools/jdk/<版本>/`：下载的 Java 运行时版本
 - `tools/adb/`：应用内下载的 ADB
 - `cache/`：AAB 转换临时文件
-- `converted/`：转换后的 universal APK
 - `apks/`：导入保存、可重复安装的 APK
 
 下载完成后，安装目录内的工具路径以相对路径保存；移动便携目录时请一并保留配置文件与 `tools/`。重复下载会先询问是否覆盖，并在下载和校验成功后替换旧目录。旧版 `tools/downloads/` 目录及配置仍可继续使用。

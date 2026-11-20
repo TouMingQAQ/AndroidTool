@@ -3501,7 +3501,7 @@ impl AndroidToolApp {
                             .strong(),
                     );
                     ui.label(
-                        RichText::new("AAB 将自动构建 Universal APK，转换产物保存在 converted/")
+                        RichText::new("AAB 转换后的 APK 会保存到 APK 列表目录")
                             .size(10.5)
                             .color(colors.muted),
                     );
@@ -4517,9 +4517,9 @@ impl AndroidToolApp {
                 if ui.link("打开安装目录").clicked() {
                     util::open_folder(&util::install_dir());
                 }
-                if ui.link("打开 converted/").clicked() {
-                    let _ = std::fs::create_dir_all(util::converted_dir());
-                    util::open_folder(&util::converted_dir());
+                if ui.link("打开 APK 目录").clicked() {
+                    let _ = std::fs::create_dir_all(util::apk_library_dir());
+                    util::open_folder(&util::apk_library_dir());
                 }
             });
             ui.add(
@@ -4982,7 +4982,7 @@ impl AndroidToolApp {
             ); });
             ui.label(
                 RichText::new(
-                    "Windows 与 macOS 均使用安装目录中的 androidtool.settings.json。转换产物写入 converted/，AAB 临时文件写入 cache/。macOS 若将 .app 安装到只读位置，请将程序放入可写目录。",
+                    "Windows 与 macOS 均使用安装目录中的 androidtool.settings.json。导入和转换 APK 均保存在 apks/，AAB 临时文件写入 cache/。macOS 若将 .app 安装到只读位置，请将程序放入可写目录。",
                 )
                 .size(10.0)
                 .color(colors.muted),

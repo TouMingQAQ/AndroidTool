@@ -8,7 +8,7 @@ use crate::util;
 
 /// Converted APKs and imported APKs both survive application restarts.
 pub fn scan() -> Result<Vec<PathBuf>, String> {
-    scan_directories(&[util::apk_library_dir(), util::converted_dir()])
+    scan_directories(&[util::apk_library_dir()])
 }
 
 fn scan_directories(directories: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
