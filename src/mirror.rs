@@ -33,14 +33,20 @@ impl MirrorOptions {
 }
 
 fn parse_fps(line: &str) -> Option<f32> {
-    let (_, value) = line.rsplit_once("FPS:")?;
-    let fps = value
-        .split_whitespace()
-        .next()?
-        .trim_matches(|c: char| !c.is_ascii_digit() && c != '.')
-        .parse::<f32>()
-        .ok()?;
-    fps.is_finite().then_some(fps)
+    let value = if let Some((_, value)) = line.rsplit_once("FPS:") {
+        value.split_whitespace().next()?
+    } else {
+        // scrcpy 5.x logs e.g. "INFO: 60 fps (+2 frames skipped)".
+        let (_, message) = line.split_once("INFO: ")?;
+        let mut words = message.split_whitespace();
+        let value = words.next()?;
+        if words.next()? != "fps" {
+            return None;
+        }
+        value
+    };
+    let fps = value.parse::<f32>().ok()?;
+    (fps.is_finite() && fps >= 0.0).then_some(fps)
 }
 
 pub fn detect_scrcpy() -> Option<PathBuf> {
@@ -188,8 +194,8 @@ impl MirrorSession {
     }
 
     #[cfg(windows)]
-    pub fn focus(&self) -> Result<(), String> {
-        crate::mirror_window::focus_scrcpy(self.child.id(), self.embedded)
+    pub fn focus_embedded(&self) -> Result<(), String> {
+        self.window.focus(self.child.id())
     }
 
     pub fn is_attached(&self) -> bool {
@@ -237,6 +243,10 @@ mod tests {
     fn parses_scrcpy_fps_status() {
         assert_eq!(parse_fps("INFO: FPS: 59.94"), Some(59.94));
         assert_eq!(parse_fps("INFO: video FPS: 60"), Some(60.0));
+        assert_eq!(parse_fps("INFO: 60 fps (+2 frames skipped)"), Some(60.0));
+        assert_eq!(parse_fps("INFO: 0 fps"), Some(0.0));
+        assert_eq!(parse_fps("WARN: 60 fps"), None);
+        assert_eq!(parse_fps("INFO: FPS: -4"), None);
         assert_eq!(parse_fps("scrcpy started"), None);
     }
 

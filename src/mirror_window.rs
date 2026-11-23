@@ -3,11 +3,9 @@
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, SetLastError};
-use windows_sys::Win32::Graphics::Gdi::{
-    CreateRoundRectRgn, DeleteObject, GetWindowRgnBox, MapWindowPoints, SetWindowRgn,
-};
+use windows_sys::Win32::Graphics::Gdi::MapWindowPoints;
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 pub struct EmbeddedWindow {
@@ -78,63 +76,10 @@ unsafe extern "system" fn find_window(window: HWND, parameter: LPARAM) -> i32 {
     1
 }
 
-pub fn focus_scrcpy(pid: u32, embedded: bool) -> Result<(), String> {
-    struct Search {
-        pid: u32,
-        window: HWND,
-    }
-    unsafe extern "system" fn find(hwnd: HWND, parameter: LPARAM) -> i32 {
-        let search = unsafe { &mut *(parameter as *mut Search) };
-        let mut pid = 0;
-        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
-        if pid == search.pid {
-            let mut title = [0_u16; 128];
-            let length = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
-            if String::from_utf16_lossy(&title[..length as usize]) == "AndroidTool - scrcpy" {
-                search.window = hwnd;
-                return 0;
-            }
-        }
-        1
-    }
-    let mut search = Search {
-        pid,
-        window: null_mut(),
-    };
-    unsafe {
-        if embedded {
-            EnumChildWindows(
-                GetDesktopWindow(),
-                Some(find),
-                &mut search as *mut _ as LPARAM,
-            );
-        } else {
-            EnumWindows(Some(find), &mut search as *mut _ as LPARAM);
-        }
-    }
-    if search.window.is_null() {
-        return Err("尚未找到 scrcpy 视频窗口，请稍后重试。".to_owned());
-    }
-    unsafe {
-        let target_thread = GetWindowThreadProcessId(search.window, null_mut());
-        let current_thread = GetCurrentThreadId();
-        let attached = target_thread != current_thread
-            && AttachThreadInput(current_thread, target_thread, 1) != 0;
-        if embedded {
-            SetFocus(search.window);
-        } else {
-            SetForegroundWindow(search.window);
-            SetFocus(search.window);
-        }
-        if attached {
-            AttachThreadInput(current_thread, target_thread, 0);
-        }
-    }
-    Ok(())
-}
+pub const GAMEPAD_OVERLAY_TITLE: &str = "AndroidTool - Floating Gamepad";
+pub const PERFORMANCE_OVERLAY_TITLE: &str = "AndroidTool - Floating Performance";
 
-#[cfg(windows)]
-pub fn own_gamepad_overlay(parent: HWND) {
+pub fn own_mirror_overlays(parent: HWND) {
     unsafe extern "system" fn find(hwnd: HWND, parameter: LPARAM) -> i32 {
         let parent = parameter as HWND;
         let mut parent_pid = 0;
@@ -148,39 +93,34 @@ pub fn own_gamepad_overlay(parent: HWND) {
         }
         let mut title = [0_u16; 128];
         let length = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
-        if String::from_utf16_lossy(&title[..length as usize]) == "AndroidTool - Floating Gamepad" {
+        let title = String::from_utf16_lossy(&title[..length as usize]);
+        if matches!(
+            title.as_str(),
+            GAMEPAD_OVERLAY_TITLE | PERFORMANCE_OVERLAY_TITLE
+        ) {
             unsafe {
-                // Owned popups stay above this app's child video, without global topmost.
+                // Keep the native popups above the child video without making them globally topmost.
                 if GetWindow(hwnd, GW_OWNER) != parent {
                     SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, parent as isize);
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOP,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
                 }
+                // Let winit/DWM compose the GL backbuffer's per-pixel alpha. WS_EX_LAYERED
+                // requires its own bitmap/alpha pipeline and can break that transparency.
                 let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-                if style & WS_EX_LAYERED == 0 {
-                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (style | WS_EX_LAYERED) as isize);
-                }
-                let mut bounds: RECT = std::mem::zeroed();
-                let mut region_bounds: RECT = std::mem::zeroed();
-                if GetWindowRect(hwnd, &mut bounds) != 0 {
-                    let width = bounds.right - bounds.left;
-                    let height = bounds.bottom - bounds.top;
-                    if GetWindowRgnBox(hwnd, &mut region_bounds) == 0
-                        || region_bounds.right != width
-                        || region_bounds.bottom != height
-                    {
-                        let diameter =
-                            (28 * windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as i32 / 96)
-                                .max(1);
-                        let region = CreateRoundRectRgn(0, 0, width, height, diameter, diameter);
-                        if !region.is_null() && SetWindowRgn(hwnd, region, 1) == 0 {
-                            DeleteObject(region);
-                        }
-                    }
+                if style & WS_EX_NOACTIVATE == 0 {
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (style | WS_EX_NOACTIVATE) as isize);
                 }
             }
-            0
-        } else {
-            1
         }
+        1
     }
     unsafe {
         EnumWindows(Some(find), parent as LPARAM);
@@ -188,6 +128,33 @@ pub fn own_gamepad_overlay(parent: HWND) {
 }
 
 impl EmbeddedWindow {
+    pub fn focus(&self, pid: u32) -> Result<(), String> {
+        unsafe {
+            let mut window_pid = 0;
+            let target_thread = GetWindowThreadProcessId(self.window, &mut window_pid);
+            if target_thread == 0 || window_pid != pid || IsWindowVisible(self.window) == 0 {
+                return Err("scrcpy 内嵌视频窗口尚未就绪。".to_owned());
+            }
+            let current_thread = GetCurrentThreadId();
+            let attached = current_thread != target_thread;
+            if attached && AttachThreadInput(current_thread, target_thread, 1) == 0 {
+                return Err(format!(
+                    "无法聚焦 scrcpy 视频窗口：{}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            SetFocus(self.window);
+            let focused = GetFocus() == self.window;
+            if attached {
+                AttachThreadInput(current_thread, target_thread, 0);
+            }
+            if !focused {
+                return Err("无法聚焦 scrcpy 视频窗口，请点击投屏画面后重试。".to_owned());
+            }
+        }
+        Ok(())
+    }
+
     pub fn sync(
         &mut self,
         pid: u32,
@@ -318,61 +285,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn floating_gamepad_is_owned_by_host_not_globally_topmost() {
+    fn floating_overlays_are_owned_without_overriding_dwm_alpha() {
         unsafe {
             let class: Vec<_> = "STATIC\0".encode_utf16().collect();
-            let title: Vec<_> = "AndroidTool - Floating Gamepad\0".encode_utf16().collect();
-            let parent = CreateWindowExW(
-                0,
-                class.as_ptr(),
-                std::ptr::null(),
-                WS_OVERLAPPEDWINDOW,
-                0,
-                0,
-                800,
-                600,
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                null_mut(),
-            );
-            let overlay = CreateWindowExW(
-                WS_EX_TOOLWINDOW,
-                class.as_ptr(),
-                title.as_ptr(),
-                WS_POPUP,
-                0,
-                0,
-                330,
-                246,
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                null_mut(),
-            );
-            assert!(!parent.is_null() && !overlay.is_null());
-            own_gamepad_overlay(parent);
-            let owner = GetWindow(overlay, GW_OWNER);
-            let topmost = GetWindowLongPtrW(overlay, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST;
-            let layered = GetWindowLongPtrW(overlay, GWL_EXSTYLE) as u32 & WS_EX_LAYERED;
-            let mut alpha = 0;
-            let mut flags = 0;
-            let attributes =
-                GetLayeredWindowAttributes(overlay, null_mut(), &mut alpha, &mut flags);
-            let mut bounds: RECT = std::mem::zeroed();
-            let region_kind = GetWindowRgnBox(overlay, &mut bounds);
-            DestroyWindow(overlay);
+            let create = |style, title: &str| {
+                let title: Vec<_> = title.encode_utf16().chain([0]).collect();
+                let window = CreateWindowExW(
+                    0,
+                    class.as_ptr(),
+                    title.as_ptr(),
+                    style,
+                    0,
+                    0,
+                    330,
+                    246,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                );
+                assert!(!window.is_null());
+                window
+            };
+            let parent = create(WS_OVERLAPPEDWINDOW, "Overlay test host");
+            let gamepad = create(WS_POPUP, GAMEPAD_OVERLAY_TITLE);
+            let performance = create(WS_POPUP, PERFORMANCE_OVERLAY_TITLE);
+            own_mirror_overlays(parent);
+            for window in [gamepad, performance] {
+                assert_eq!(GetWindow(window, GW_OWNER), parent);
+                let style = GetWindowLongPtrW(window, GWL_EXSTYLE) as u32;
+                assert_eq!(style & (WS_EX_TOPMOST | WS_EX_LAYERED), 0);
+                assert_ne!(style & WS_EX_NOACTIVATE, 0);
+            }
             DestroyWindow(parent);
-            assert_eq!(owner, parent);
-            assert_eq!(topmost, 0);
-            assert_ne!(layered, 0);
-            assert_eq!(attributes, 0);
-            assert_eq!(alpha, 0);
-            assert_eq!(flags, 0);
-            assert_eq!(
-                region_kind,
-                windows_sys::Win32::Graphics::Gdi::COMPLEXREGION
-            );
         }
     }
 

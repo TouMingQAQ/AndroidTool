@@ -1903,28 +1903,23 @@ impl AndroidToolApp {
                     .show_ui(ui, |ui| {
                         ui.set_width(330.0);
                         ui.label(RichText::new("选择操作设备").size(11.0).color(colors.muted));
-                        let devices = self.devices.clone();
-                        if devices.is_empty() {
+                        if self.devices.is_empty() {
                             ui.label("暂无设备，请连接手机或使用无线配对");
                         }
-                        ScrollArea::vertical()
-                            .id_salt("device-card-list")
-                            .max_height(360.0)
-                            .show(ui, |ui| {
-                                for device in &devices {
-                                    if device_picker_card(
-                                        ui,
-                                        device,
-                                        selected.as_deref() == Some(&device.serial),
-                                        310.0,
-                                    )
-                                    .clicked()
-                                    {
-                                        selected = Some(device.serial.clone());
-                                        ui.close();
-                                    }
-                                }
-                            });
+                        // ComboBox already scrolls; a nested scroll area can clip the cards.
+                        for device in &self.devices {
+                            if device_picker_card(
+                                ui,
+                                device,
+                                selected.as_deref() == Some(device.serial.as_str()),
+                                ui.available_width(),
+                            )
+                            .clicked()
+                            {
+                                selected = Some(device.serial.clone());
+                                ui.close();
+                            }
+                        }
                     });
                 if selected != self.active_serial {
                     self.set_active_device(selected);
@@ -2435,6 +2430,7 @@ impl AndroidToolApp {
             let mut changed = false;
             changed |= ui
                 .add(egui::Slider::new(&mut self.config.mirror_fps, 1..=60).suffix(" FPS"))
+                .on_hover_text("视频帧率上限 · 重启视频流后生效")
                 .changed();
             changed |= ui
                 .add(
@@ -2442,12 +2438,14 @@ impl AndroidToolApp {
                         .range(640..=2560)
                         .suffix(" px"),
                 )
+                .on_hover_text("视频最长边上限 · 重启视频流后生效")
                 .changed();
             changed |= ui
                 .add(
                     egui::Slider::new(&mut self.config.mirror_bit_rate_mbps, 1..=32)
                         .suffix(" Mbps"),
                 )
+                .on_hover_text("视频编码码率 · 重启视频流后生效")
                 .changed();
             if changed {
                 self.mark_config_dirty();
@@ -2565,103 +2563,109 @@ impl AndroidToolApp {
         });
     }
 
-    fn show_performance_overlay(&mut self, ctx: &egui::Context) {
-        if self.page != Page::Screen || !self.config.scrcpy_enabled || self.screen.mirror.is_none()
-        {
-            return;
-        }
-        let Some(canvas) = self.screen.canvas_rect else {
-            return;
-        };
-        let fps = self
-            .screen
-            .mirror
-            .as_ref()
-            .and_then(MirrorSession::measured_fps);
-        let label = format!(
-            "{} FPS  ·  {} px  ·  {} Mbps",
-            fps.map(|value| format!("{value:.0}"))
-                .unwrap_or_else(|| "--".to_owned()),
-            self.config.mirror_max_size,
-            self.config.mirror_bit_rate_mbps,
-        );
-        let pos = egui::pos2(
-            (canvas.right() - 214.0).max(canvas.left() + 8.0),
-            canvas.top() + 12.0,
-        );
-        let hovered = ctx
-            .input(|input| input.pointer.hover_pos())
-            .is_some_and(|pointer| {
-                Rect::from_min_size(pos, egui::vec2(206.0, 34.0)).contains(pointer)
-            });
-        let colors = theme::palette(ctx);
-        egui::Area::new(Id::new("scrcpy-performance-overlay"))
-            .order(Order::Foreground)
-            .fixed_pos(pos)
-            .show(ctx, |ui| {
-                Frame::new()
-                    .fill(if hovered {
-                        theme::alpha(colors.panel, 0.72)
-                    } else {
-                        Color32::TRANSPARENT
-                    })
-                    .stroke(if hovered {
-                        Stroke::new(1.0, theme::alpha(colors.accent, 0.35))
-                    } else {
-                        Stroke::NONE
-                    })
-                    .corner_radius(9)
-                    .inner_margin(egui::Margin::symmetric(9, 6))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(label).size(11.0).color(colors.text));
-                    });
-            });
+    fn screen_overlays_visible(&self, ctx: &egui::Context) -> bool {
+        self.page == Page::Screen
+            && !self.wireless.open
+            && !egui::Popup::is_any_open(ctx)
+            && !ctx.input(|input| {
+                input.viewport().minimized == Some(true) || !input.raw.hovered_files.is_empty()
+            })
     }
 
     #[cfg(windows)]
-    fn show_keyboard_focus_button(&mut self, ctx: &egui::Context) {
-        if self.page != Page::Screen || !self.config.scrcpy_enabled || self.screen.mirror.is_none()
-        {
+    fn show_performance_overlay(&self, ctx: &egui::Context) {
+        use crate::mirror_window::PERFORMANCE_OVERLAY_TITLE;
+
+        if !self.screen_overlays_visible(ctx) || !self.config.scrcpy_enabled {
             return;
         }
-        let Some(canvas) = self.screen.canvas_rect else {
+        let Some(session) = self
+            .screen
+            .mirror
+            .as_ref()
+            .filter(|session| session.is_attached())
+        else {
             return;
         };
+        let Some(canvas) = self.screen.mirror_rect else {
+            return;
+        };
+        let Some(origin) = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.min))
+        else {
+            return;
+        };
+        let size = egui::vec2(232.0_f32.min(canvas.width() - 16.0), 63.0);
+        if size.x < 100.0 || canvas.height() < size.y + 16.0 {
+            return;
+        }
+        let pos = canvas.right_top() + egui::vec2(-size.x - 8.0, 8.0);
+        let rect = Rect::from_min_size(pos, size);
+        let fps = session
+            .measured_fps()
+            .map_or_else(|| "—".to_owned(), |fps| format!("{fps:.0}"));
+        let device = self
+            .active_device()
+            .map(|device| device.display_name())
+            .unwrap_or_default();
+        let resolution = self.screen.device_size.map_or_else(
+            || "分辨率读取中…".to_owned(),
+            |[width, height]| format!("屏幕 {width} × {height}"),
+        );
+        let stats = format!(
+            "{fps} FPS / {}  ·  {} Mbps",
+            session.options.fps, session.options.bit_rate_mbps
+        );
         let colors = theme::palette(ctx);
-        egui::Area::new(Id::new("scrcpy-keyboard-focus"))
-            .order(Order::Foreground)
-            .fixed_pos(canvas.left_bottom() + egui::vec2(12.0, -48.0))
-            .show(ctx, |ui| {
-                let response = ui
-                    .add(
-                        egui::Button::new(RichText::new("⌨ 键盘输入").size(11.0))
-                            .fill(theme::alpha(colors.panel, 0.88))
-                            .stroke(Stroke::new(1.0, theme::alpha(colors.accent, 0.55)))
-                            .corner_radius(9),
-                    )
-                    .on_hover_text("聚焦 scrcpy 投屏后，实体键盘按键将转发到手机");
-                if response.clicked() {
-                    if let Some(session) = self.screen.mirror.as_ref() {
-                        if let Err(error) = session.focus() {
-                            self.screen.error = Some(error);
-                        } else {
-                            self.screen.error = None;
-                        }
+        let builder =
+            floating_overlay_builder(PERFORMANCE_OVERLAY_TITLE, origin + pos.to_vec2(), size);
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("floating-scrcpy-performance"),
+            builder,
+            |overlay_ctx, class| {
+                let draw = |ui: &mut Ui, rect: Rect| {
+                    let hovered = ui
+                        .input(|input| input.pointer.hover_pos())
+                        .is_some_and(|pos| rect.contains(pos));
+                    let painter = ui.painter_at(rect.shrink(1.0));
+                    painter.rect_filled(rect, 12, overlay_background(colors.panel, hovered));
+                    let text_width = rect.width() - 16.0;
+                    for (row, text) in [&stats, &device, &resolution].into_iter().enumerate() {
+                        let mut job = egui::text::LayoutJob::simple(
+                            text.clone(),
+                            FontId::proportional(12.0),
+                            Color32::PLACEHOLDER,
+                            text_width,
+                        );
+                        job.wrap.max_rows = 1;
+                        let galley = painter.layout_job(job);
+                        let pos = rect.left_top() + egui::vec2(8.0, 7.0 + 16.0 * row as f32);
+                        painter.galley_with_override_text_color(
+                            pos + egui::vec2(1.0, 1.0),
+                            galley.clone(),
+                            Color32::BLACK,
+                        );
+                        painter.galley(pos, galley, Color32::WHITE);
                     }
+                };
+                if class == egui::ViewportClass::Embedded {
+                    egui::Area::new(Id::new("scrcpy-performance-fallback"))
+                        .order(Order::Foreground)
+                        .fixed_pos(pos)
+                        .interactable(false)
+                        .show(overlay_ctx, |ui| draw(ui, rect));
+                } else {
+                    egui::CentralPanel::default()
+                        .frame(Frame::NONE)
+                        .show(overlay_ctx, |ui| draw(ui, ui.max_rect()));
                 }
-            });
+            },
+        );
     }
 
     fn show_gamepad_overlay(&mut self, ctx: &egui::Context) {
         let colors = theme::palette(ctx);
-        if self.page != Page::Screen
-            || !self.screen.gamepad_overlay_open
-            || self.wireless.open
-            || egui::Popup::is_any_open(ctx)
-            || ctx.input(|input| {
-                input.viewport().minimized == Some(true) || !input.raw.hovered_files.is_empty()
-            })
-        {
+        if !self.screen.gamepad_overlay_open || !self.screen_overlays_visible(ctx) {
+            self.screen.gamepad_drag_offset = None;
             return;
         }
         let Some(area) = self.screen.canvas_rect else {
@@ -2680,16 +2684,11 @@ impl AndroidToolApp {
         let origin = ctx
             .input(|input| input.viewport().inner_rect.map(|rect| rect.min))
             .unwrap_or_default();
-        let builder = egui::ViewportBuilder::default()
-            .with_title("AndroidTool - Floating Gamepad")
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_has_shadow(false)
-            .with_resizable(false)
-            .with_taskbar(false)
-            .with_active(false)
-            .with_position(origin + rect.min.to_vec2())
-            .with_inner_size(size);
+        #[cfg(windows)]
+        let title = crate::mirror_window::GAMEPAD_OVERLAY_TITLE;
+        #[cfg(not(windows))]
+        let title = "AndroidTool - Floating Gamepad";
+        let builder = floating_overlay_builder(title, origin + rect.min.to_vec2(), size);
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("floating-gamepad"),
             builder,
@@ -2798,11 +2797,7 @@ impl AndroidToolApp {
                                 .input(|input| input.pointer.hover_pos())
                                 .is_some_and(|pos| rect.contains(pos));
                             Frame::new()
-                                .fill(if hover {
-                                    theme::alpha(colors.panel, 0.76)
-                                } else {
-                                    Color32::TRANSPARENT
-                                })
+                                .fill(overlay_background(colors.panel, hover))
                                 .corner_radius(14)
                                 .inner_margin(8)
                                 .show(ui, |ui| draw(ui, self));
@@ -2811,32 +2806,28 @@ impl AndroidToolApp {
                     if overlay_ctx.input(|input| input.viewport().close_requested()) {
                         self.screen.gamepad_overlay_open = false;
                     }
-                    let hovered = overlay_ctx.input(|input| input.pointer.hover_pos().is_some());
                     egui::CentralPanel::default()
-                        .frame(
+                        .frame(Frame::NONE)
+                        .show(overlay_ctx, |ui| {
+                            let bounds = ui.max_rect();
+                            let hovered = ui
+                                .input(|input| input.pointer.hover_pos())
+                                .is_some_and(|pos| bounds.contains(pos));
                             Frame::new()
-                                .fill(if hovered {
-                                    theme::alpha(colors.panel, 0.76)
-                                } else {
-                                    Color32::TRANSPARENT
-                                })
-                                .stroke(if hovered {
-                                    Stroke::new(1.0, theme::alpha(colors.accent, 0.4))
-                                } else {
-                                    Stroke::NONE
-                                })
+                                .fill(overlay_background(colors.panel, hovered))
                                 .corner_radius(14)
-                                .inner_margin(8),
-                        )
-                        .show(overlay_ctx, |ui| draw(ui, self));
+                                .inner_margin(8)
+                                .show(ui, |ui| {
+                                    ui.set_min_size(
+                                        (bounds.size() - Vec2::splat(16.0)).max(Vec2::ZERO),
+                                    );
+                                    draw(ui, self);
+                                });
+                        });
                     overlay_ctx.request_repaint_after(Duration::from_millis(16));
                 }
             },
         );
-        #[cfg(windows)]
-        if let Some(parent) = self.native_window {
-            crate::mirror_window::own_gamepad_overlay(parent as _);
-        }
     }
 
     #[cfg(windows)]
@@ -3177,9 +3168,38 @@ impl AndroidToolApp {
         {
             self.screen.gamepad_overlay_open = !self.screen.gamepad_overlay_open;
         }
+        #[cfg(windows)]
+        if self.config.scrcpy_enabled && self.config.mirror_embedded {
+            let session = self
+                .screen
+                .mirror
+                .as_ref()
+                .filter(|session| session.is_attached());
+            let response = ui
+                .add_enabled_ui(session.is_some(), |ui| {
+                    ui.add_sized(
+                        [ui.available_width(), 34.0],
+                        egui::Button::new("键盘输入")
+                            .fill(colors.card)
+                            .corner_radius(9),
+                    )
+                })
+                .inner
+                .on_hover_text("聚焦内嵌投屏，用实体键盘直接控制手机")
+                .on_disabled_hover_text("内嵌视频连接后可用");
+            if response.clicked()
+                && let Some(session) = session
+            {
+                if let Err(error) = session.focus_embedded() {
+                    self.screen.error = Some(error);
+                } else {
+                    self.screen.error = None;
+                }
+            }
+        }
         ui.add(
             egui::Label::new(
-                RichText::new("半透明悬浮手柄 · 拖动图标调整位置")
+                RichText::new("拖动左上角图标调整手柄位置")
                     .size(9.5)
                     .color(colors.muted),
             )
@@ -5724,17 +5744,24 @@ impl eframe::App for AndroidToolApp {
                 }
             });
 
-        self.show_performance_overlay(ctx);
         #[cfg(windows)]
-        self.show_keyboard_focus_button(ctx);
+        self.sync_embedded_mirror(ctx);
+        if self.page == Page::Screen {
+            self.gamepad.virtual_state = GamepadVisualState::default();
+        }
         self.show_gamepad_overlay(ctx);
+        #[cfg(windows)]
+        {
+            self.show_performance_overlay(ctx);
+            if let Some(parent) = self.native_window {
+                crate::mirror_window::own_mirror_overlays(parent as _);
+            }
+        }
         self.send_gamepad_state();
         self.show_wireless_modal(ctx);
         self.show_signing_modal(ctx);
         self.show_drop_overlay(ctx);
         self.show_toasts(ctx);
-        #[cfg(windows)]
-        self.sync_embedded_mirror(ctx);
     }
 }
 
@@ -5821,6 +5848,31 @@ fn device_picker_card(
         colors.muted,
     );
     response.on_hover_text(&device.serial)
+}
+
+fn overlay_background(color: Color32, hovered: bool) -> Color32 {
+    if hovered {
+        theme::alpha(color, 0.3)
+    } else {
+        Color32::TRANSPARENT
+    }
+}
+
+fn floating_overlay_builder(
+    title: &str,
+    position: egui::Pos2,
+    size: Vec2,
+) -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_has_shadow(false)
+        .with_resizable(false)
+        .with_taskbar(false)
+        .with_active(false)
+        .with_position(position)
+        .with_inner_size(size)
 }
 
 fn gamepad_overlay_rect(area: Rect, size: Vec2, position: egui::Pos2) -> Rect {
@@ -6646,6 +6698,15 @@ drwxrwx--- 2 root sdcard_rw 4096 2026-11-11 10:20 Download
                 });
             });
         }
+    }
+
+    #[test]
+    fn overlay_background_is_clear_until_hover_and_then_30_percent() {
+        let panel = Color32::from_rgb(80, 100, 120);
+        assert_eq!(overlay_background(panel, false), Color32::TRANSPARENT);
+        let hovered = overlay_background(panel, true);
+        assert_eq!(hovered.a(), 76);
+        assert_eq!(hovered, Color32::from_rgba_unmultiplied(80, 100, 120, 76));
     }
 
     #[test]

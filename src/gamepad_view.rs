@@ -64,16 +64,17 @@ impl Pad<'_> {
         );
         let response = self
             .ui
-            .interact(rect, Id::new(("pad-button", key)), Sense::click())
+            .interact(rect, Id::new(("pad-button", key)), Sense::click_and_drag())
             .on_hover_text(format!("{label} · {key}"));
+        // A click-only widget loses its press when egui's click timeout expires.
+        let held = response.is_pointer_button_down_on()
+            && self.ui.input(|input| input.pointer.primary_down());
         let trigger_value = match key {
             "left_trigger" => self.state.triggers[0],
             "right_trigger" => self.state.triggers[1],
             _ => 0.0,
         };
-        let active = response.is_pointer_button_down_on()
-            || self.state.buttons.contains(key)
-            || trigger_value > 0.01;
+        let active = held || self.state.buttons.contains(key) || trigger_value > 0.01;
         let fill = if active {
             ACCENT_DARK
         } else if response.hovered() {
@@ -109,7 +110,7 @@ impl Pad<'_> {
                 if active { Color32::WHITE } else { TEXT },
             );
         }
-        if response.is_pointer_button_down_on() {
+        if held {
             self.actions.push(key.to_owned());
         }
     }
@@ -531,11 +532,22 @@ mod tests {
         width: f32,
         events: Vec<egui::Event>,
     ) -> (Vec<String>, egui::FullOutput) {
+        frame_at(ctx, kind, width, events, None)
+    }
+
+    fn frame_at(
+        ctx: &egui::Context,
+        kind: GamepadKind,
+        width: f32,
+        events: Vec<egui::Event>,
+        time: Option<f64>,
+    ) -> (Vec<String>, egui::FullOutput) {
         let mut actions = Vec::new();
         let output = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(width, 440.0))),
                 events,
+                time,
                 ..Default::default()
             },
             |ctx| {
@@ -625,16 +637,21 @@ mod tests {
                     .zip(["south", "left_trigger", "right_trigger", "mode"])
             {
                 let ctx = egui::Context::default();
-                frame(&ctx, kind, 576.0, Vec::new());
+                frame_at(&ctx, kind, 576.0, Vec::new(), Some(0.0));
                 let pos = Pos2::new(x + 8.0, y + 8.0);
-                let (actions, _) = frame(&ctx, kind, 576.0, pointer(pos, true));
+                let (actions, _) = frame_at(&ctx, kind, 576.0, pointer(pos, true), Some(0.1));
                 assert!(
                     actions.iter().any(|action| action == key),
                     "{kind:?}: {actions:?}"
                 );
-                let (held, _) = frame(&ctx, kind, 576.0, Vec::new());
-                assert!(held.iter().any(|action| action == key));
-                let (released, _) = frame(&ctx, kind, 576.0, pointer(pos, false));
+                for time in [0.2, 2.0, 5.0] {
+                    let (held, _) = frame_at(&ctx, kind, 576.0, Vec::new(), Some(time));
+                    assert!(
+                        held.iter().any(|action| action == key),
+                        "{kind:?}: {key} at {time}s"
+                    );
+                }
+                let (released, _) = frame_at(&ctx, kind, 576.0, pointer(pos, false), Some(5.1));
                 assert!(!released.iter().any(|action| action == key));
             }
         }
