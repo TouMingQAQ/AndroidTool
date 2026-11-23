@@ -32,6 +32,17 @@ impl MirrorOptions {
     }
 }
 
+fn parse_fps(line: &str) -> Option<f32> {
+    let (_, value) = line.rsplit_once("FPS:")?;
+    let fps = value
+        .split_whitespace()
+        .next()?
+        .trim_matches(|c: char| !c.is_ascii_digit() && c != '.')
+        .parse::<f32>()
+        .ok()?;
+    fps.is_finite().then_some(fps)
+}
+
 pub fn detect_scrcpy() -> Option<PathBuf> {
     let name = if cfg!(windows) {
         "scrcpy.exe"
@@ -165,11 +176,20 @@ impl MirrorSession {
         }
     }
 
+    pub fn measured_fps(&self) -> Option<f32> {
+        self.lines.iter().rev().find_map(|line| parse_fps(line))
+    }
+
     pub fn latest_status(&self) -> &str {
         self.lines
             .back()
             .map(String::as_str)
             .unwrap_or("正在启动视频流…")
+    }
+
+    #[cfg(windows)]
+    pub fn focus(&self) -> Result<(), String> {
+        crate::mirror_window::focus_scrcpy(self.child.id(), self.embedded)
     }
 
     pub fn is_attached(&self) -> bool {
@@ -212,6 +232,13 @@ impl Drop for MirrorSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_scrcpy_fps_status() {
+        assert_eq!(parse_fps("INFO: FPS: 59.94"), Some(59.94));
+        assert_eq!(parse_fps("INFO: video FPS: 60"), Some(60.0));
+        assert_eq!(parse_fps("scrcpy started"), None);
+    }
 
     #[cfg(windows)]
     #[test]

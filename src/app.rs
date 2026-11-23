@@ -1517,7 +1517,6 @@ impl AndroidToolApp {
                 self.gamepad.target = None;
             }
         }
-        self.gamepad.virtual_state = GamepadVisualState::default();
     }
 
     fn send_gamepad_state(&self) {
@@ -1894,6 +1893,7 @@ impl AndroidToolApp {
                     .map(|device| device.display_name())
                     .unwrap_or_else(|| "未选择设备".to_owned());
                 egui::ComboBox::from_id_salt("top-device-selector")
+                    .height(420.0)
                     .selected_text(
                         RichText::new(format!("设备 · {selected_label}"))
                             .size(12.5)
@@ -2565,6 +2565,93 @@ impl AndroidToolApp {
         });
     }
 
+    fn show_performance_overlay(&mut self, ctx: &egui::Context) {
+        if self.page != Page::Screen || !self.config.scrcpy_enabled || self.screen.mirror.is_none()
+        {
+            return;
+        }
+        let Some(canvas) = self.screen.canvas_rect else {
+            return;
+        };
+        let fps = self
+            .screen
+            .mirror
+            .as_ref()
+            .and_then(MirrorSession::measured_fps);
+        let label = format!(
+            "{} FPS  ·  {} px  ·  {} Mbps",
+            fps.map(|value| format!("{value:.0}"))
+                .unwrap_or_else(|| "--".to_owned()),
+            self.config.mirror_max_size,
+            self.config.mirror_bit_rate_mbps,
+        );
+        let pos = egui::pos2(
+            (canvas.right() - 214.0).max(canvas.left() + 8.0),
+            canvas.top() + 12.0,
+        );
+        let hovered = ctx
+            .input(|input| input.pointer.hover_pos())
+            .is_some_and(|pointer| {
+                Rect::from_min_size(pos, egui::vec2(206.0, 34.0)).contains(pointer)
+            });
+        let colors = theme::palette(ctx);
+        egui::Area::new(Id::new("scrcpy-performance-overlay"))
+            .order(Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(if hovered {
+                        theme::alpha(colors.panel, 0.72)
+                    } else {
+                        Color32::TRANSPARENT
+                    })
+                    .stroke(if hovered {
+                        Stroke::new(1.0, theme::alpha(colors.accent, 0.35))
+                    } else {
+                        Stroke::NONE
+                    })
+                    .corner_radius(9)
+                    .inner_margin(egui::Margin::symmetric(9, 6))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(label).size(11.0).color(colors.text));
+                    });
+            });
+    }
+
+    #[cfg(windows)]
+    fn show_keyboard_focus_button(&mut self, ctx: &egui::Context) {
+        if self.page != Page::Screen || !self.config.scrcpy_enabled || self.screen.mirror.is_none()
+        {
+            return;
+        }
+        let Some(canvas) = self.screen.canvas_rect else {
+            return;
+        };
+        let colors = theme::palette(ctx);
+        egui::Area::new(Id::new("scrcpy-keyboard-focus"))
+            .order(Order::Foreground)
+            .fixed_pos(canvas.left_bottom() + egui::vec2(12.0, -48.0))
+            .show(ctx, |ui| {
+                let response = ui
+                    .add(
+                        egui::Button::new(RichText::new("⌨ 键盘输入").size(11.0))
+                            .fill(theme::alpha(colors.panel, 0.88))
+                            .stroke(Stroke::new(1.0, theme::alpha(colors.accent, 0.55)))
+                            .corner_radius(9),
+                    )
+                    .on_hover_text("聚焦 scrcpy 投屏后，实体键盘按键将转发到手机");
+                if response.clicked() {
+                    if let Some(session) = self.screen.mirror.as_ref() {
+                        if let Err(error) = session.focus() {
+                            self.screen.error = Some(error);
+                        } else {
+                            self.screen.error = None;
+                        }
+                    }
+                }
+            });
+    }
+
     fn show_gamepad_overlay(&mut self, ctx: &egui::Context) {
         let colors = theme::palette(ctx);
         if self.page != Page::Screen
@@ -2691,7 +2778,6 @@ impl AndroidToolApp {
                             }
                         });
                     });
-                    ui.set_opacity(0.82);
                     app.virtual_gamepad(ui);
                     ui.add(
                         egui::Label::new(
@@ -2708,8 +2794,15 @@ impl AndroidToolApp {
                         .order(Order::Foreground)
                         .show(overlay_ctx, |ui| {
                             ui.set_width(size.x - 16.0);
+                            let hover = overlay_ctx
+                                .input(|input| input.pointer.hover_pos())
+                                .is_some_and(|pos| rect.contains(pos));
                             Frame::new()
-                                .fill(theme::alpha(colors.panel, 0.90))
+                                .fill(if hover {
+                                    theme::alpha(colors.panel, 0.76)
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
                                 .corner_radius(14)
                                 .inner_margin(8)
                                 .show(ui, |ui| draw(ui, self));
@@ -2718,11 +2811,20 @@ impl AndroidToolApp {
                     if overlay_ctx.input(|input| input.viewport().close_requested()) {
                         self.screen.gamepad_overlay_open = false;
                     }
+                    let hovered = overlay_ctx.input(|input| input.pointer.hover_pos().is_some());
                     egui::CentralPanel::default()
                         .frame(
                             Frame::new()
-                                .fill(theme::alpha(colors.panel, 0.86))
-                                .stroke(Stroke::new(1.0, theme::alpha(colors.accent, 0.4)))
+                                .fill(if hovered {
+                                    theme::alpha(colors.panel, 0.76)
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .stroke(if hovered {
+                                    Stroke::new(1.0, theme::alpha(colors.accent, 0.4))
+                                } else {
+                                    Stroke::NONE
+                                })
                                 .corner_radius(14)
                                 .inner_margin(8),
                         )
@@ -5622,6 +5724,9 @@ impl eframe::App for AndroidToolApp {
                 }
             });
 
+        self.show_performance_overlay(ctx);
+        #[cfg(windows)]
+        self.show_keyboard_focus_button(ctx);
         self.show_gamepad_overlay(ctx);
         self.send_gamepad_state();
         self.show_wireless_modal(ctx);

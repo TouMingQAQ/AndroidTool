@@ -6,6 +6,7 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, SetLastError};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateRoundRectRgn, DeleteObject, GetWindowRgnBox, MapWindowPoints, SetWindowRgn,
 };
+use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 pub struct EmbeddedWindow {
@@ -76,6 +77,61 @@ unsafe extern "system" fn find_window(window: HWND, parameter: LPARAM) -> i32 {
     1
 }
 
+pub fn focus_scrcpy(pid: u32, embedded: bool) -> Result<(), String> {
+    struct Search {
+        pid: u32,
+        window: HWND,
+    }
+    unsafe extern "system" fn find(hwnd: HWND, parameter: LPARAM) -> i32 {
+        let search = unsafe { &mut *(parameter as *mut Search) };
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid == search.pid {
+            let mut title = [0_u16; 128];
+            let length = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
+            if String::from_utf16_lossy(&title[..length as usize]) == "AndroidTool - scrcpy" {
+                search.window = hwnd;
+                return 0;
+            }
+        }
+        1
+    }
+    let mut search = Search {
+        pid,
+        window: null_mut(),
+    };
+    unsafe {
+        if embedded {
+            EnumChildWindows(
+                GetDesktopWindow(),
+                Some(find),
+                &mut search as *mut _ as LPARAM,
+            );
+        } else {
+            EnumWindows(Some(find), &mut search as *mut _ as LPARAM);
+        }
+    }
+    if search.window.is_null() {
+        return Err("尚未找到 scrcpy 视频窗口，请稍后重试。".to_owned());
+    }
+    unsafe {
+        let target_thread = GetWindowThreadProcessId(search.window, null_mut());
+        let current_thread = GetCurrentThreadId();
+        let attached = target_thread != current_thread
+            && AttachThreadInput(current_thread, target_thread, 1) != 0;
+        if embedded {
+            SetFocus(search.window);
+        } else {
+            SetForegroundWindow(search.window);
+            SetFocus(search.window);
+        }
+        if attached {
+            AttachThreadInput(current_thread, target_thread, 0);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 pub fn own_gamepad_overlay(parent: HWND) {
     unsafe extern "system" fn find(hwnd: HWND, parameter: LPARAM) -> i32 {
@@ -100,7 +156,6 @@ pub fn own_gamepad_overlay(parent: HWND) {
                 let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
                 if style & WS_EX_LAYERED == 0 {
                     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (style | WS_EX_LAYERED) as isize);
-                    SetLayeredWindowAttributes(hwnd, 0, 190, LWA_ALPHA);
                 }
                 let mut bounds: RECT = std::mem::zeroed();
                 let mut region_bounds: RECT = std::mem::zeroed();
@@ -310,9 +365,9 @@ mod tests {
             assert_eq!(owner, parent);
             assert_eq!(topmost, 0);
             assert_ne!(layered, 0);
-            assert_ne!(attributes, 0);
-            assert_eq!(alpha, 190);
-            assert_eq!(flags, LWA_ALPHA);
+            assert_eq!(attributes, 0);
+            assert_eq!(alpha, 0);
+            assert_eq!(flags, 0);
             assert_eq!(
                 region_kind,
                 windows_sys::Win32::Graphics::Gdi::COMPLEXREGION
