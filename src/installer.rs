@@ -505,6 +505,7 @@ struct ConversionScratch {
 
 impl ConversionScratch {
     fn new() -> Result<Self, String> {
+        util::ensure_dir(&util::cache_dir())?;
         let root = fs::canonicalize(util::cache_dir()).map_err(|error| error.to_string())?;
         let mut random = [0; 16];
         SystemRandom::new()
