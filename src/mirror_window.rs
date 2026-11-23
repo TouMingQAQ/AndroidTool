@@ -7,6 +7,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateRoundRectRgn, DeleteObject, GetWindowRgnBox, MapWindowPoints, SetWindowRgn,
 };
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 pub struct EmbeddedWindow {

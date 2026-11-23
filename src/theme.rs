@@ -167,11 +167,11 @@ fn make_style(theme: egui::Theme) -> egui::Style {
     } else {
         Color32::from_rgb(184, 225, 219)
     };
-    visuals.selection.stroke = Stroke::new(1.0, colors.accent);
+    visuals.selection.stroke = Stroke::new(1.0_f32, colors.accent);
     visuals.hyperlink_color = colors.accent;
     visuals.warn_fg_color = colors.orange;
     visuals.error_fg_color = colors.red;
-    visuals.window_stroke = Stroke::new(1.0, colors.border);
+    visuals.window_stroke = Stroke::new(1.0_f32, colors.border);
     visuals.window_corner_radius = CornerRadius::same(16);
     visuals.menu_corner_radius = CornerRadius::same(10);
     visuals.popup_shadow = egui::epaint::Shadow {
@@ -183,32 +183,32 @@ fn make_style(theme: egui::Theme) -> egui::Style {
 
     visuals.widgets.noninteractive.bg_fill = colors.panel;
     visuals.widgets.noninteractive.weak_bg_fill = colors.panel;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, colors.border);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, colors.text);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, colors.border);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, colors.text);
     visuals.widgets.noninteractive.corner_radius = CornerRadius::same(10);
 
     visuals.widgets.inactive.bg_fill = colors.card;
     visuals.widgets.inactive.weak_bg_fill = colors.card;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, colors.border);
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, colors.text);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, colors.border);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, colors.text);
     visuals.widgets.inactive.corner_radius = CornerRadius::same(10);
 
     visuals.widgets.hovered.bg_fill = colors.card_hover;
     visuals.widgets.hovered.weak_bg_fill = colors.card_hover;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, colors.accent_dark);
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, colors.text);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, colors.accent_dark);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, colors.text);
     visuals.widgets.hovered.corner_radius = CornerRadius::same(10);
 
     visuals.widgets.active.bg_fill = colors.card_hover;
     visuals.widgets.active.weak_bg_fill = colors.card_hover;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, colors.accent);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.5, colors.text);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, colors.accent);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, colors.text);
     visuals.widgets.active.corner_radius = CornerRadius::same(10);
 
     visuals.widgets.open.bg_fill = colors.card_hover;
     visuals.widgets.open.weak_bg_fill = colors.card_hover;
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0, colors.border);
-    visuals.widgets.open.fg_stroke = Stroke::new(1.0, colors.text);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, colors.border);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, colors.text);
     visuals.widgets.open.corner_radius = CornerRadius::same(10);
     style.visuals = visuals;
 
